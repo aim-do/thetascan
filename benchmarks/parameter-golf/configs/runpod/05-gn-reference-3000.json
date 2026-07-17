@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "suite_id": "public-h100-gn-reference-3000-v1",
+  "description": "Reproducible 0-to-3000 run of the GN reference: two-stage W1+W2 feature-mass normalization, one recency branch, shared Q/K, and headwise Muon.",
+  "seed_policy": "explicit_shared_across_pods",
+  "hardware": {
+    "gpu_count": 1,
+    "gpu_type": "NVIDIA H100 80GB HBM3"
+  },
+  "launcher": {
+    "hard_timeout_seconds": 6300,
+    "result_grace_seconds": 300,
+    "max_budget_usd": 5.5
+  },
+  "data": {
+    "variant": "sp1024",
+    "train_shards": 16
+  },
+  "protocols": {
+    "smoke": {
+      "iterations": 7500,
+      "segment_start_step": 0,
+      "segment_end_step": 20,
+      "val_start_step": 0,
+      "val_every": 20,
+      "warmup_steps": 5,
+      "warmdown_iters": 750,
+      "max_wallclock_seconds": 600.0,
+      "timeout_seconds": 900,
+      "checkpoint_at_end": true
+    },
+    "production": {
+      "iterations": 7500,
+      "segment_start_step": 20,
+      "segment_end_step": 3000,
+      "val_start_step": 1000,
+      "val_every": 250,
+      "warmup_steps": 20,
+      "warmdown_iters": 750,
+      "max_wallclock_seconds": 0.0,
+      "timeout_seconds": 4500,
+      "checkpoint_at_end": true
+    }
+  },
+  "runs": [
+    {
+      "id": "gn-reference-3000",
+      "arm": "thetascan",
+      "recipe": "gn-reference-v0.1",
+      "rope": "partial",
+      "backend": "quad",
+      "projection_layout": "mamba-shared",
+      "optimizer_policy": "muon-2d+theta",
+      "expected_model_params": 17059928,
+      "artifact_cap_bytes": 16000000,
+      "required_log_regex": [
+        "mixer_impl:ThetaScan",
+        "model_params:17059928",
+        "theta_projection_layout:mamba-shared",
+        "optimizer_adam_theta_controls:tensor_count=6 parameter_count=2080",
+        "thetascan_config:.*'family': 'gn'",
+        "thetascan_config:.*'read_normalization': 'both_feature_mass'",
+        "thetascan_config:.*'feature_expansion': 1",
+        "thetascan_config:.*'temporal': {'mode': 'bank'",
+        "ffn_hidden:full=1024 .*thetascan=1023",
+        "final_int8_zlib_roundtrip_exact",
+        "Total submission size int8\\+zlib: [0-9]+ bytes"
+      ],
+      "expected_theta_headwise_muon_tensors": 4,
+      "expected_theta_headwise_muon_params": 393216
+    }
+  ]
+}

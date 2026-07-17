@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+message: "If you use ThetaScan, please cite the repository version you used."
+title: "ThetaScan"
+version: "0.1.0"
+type: software
+license: PolyForm-Small-Business-1.0.0
+date-released: "2026-07-24"
+abstract: >-
+  A source-available PyTorch implementation of scan-parallel nonlinear fast
+  memory with Gauss--Newton and normalized positive-feature kernel families,
+  random feature expansion, and temporal-mode banks.
+keywords:
+  - nonlinear memory
+  - sequence modeling
+  - associative scan
+  - fast weights
+  - kernel regression
+  - recurrent memory
+authors:
+  - name: "Ultimamind SRL"
+    email: "hi@aim.do"
+    country: BE
+preferred-citation:
+  type: article
+  title: "ThetaScan: Scan-Parallel Nonlinear Memory"
+  version: "0.1"
+  year: 2026
+  authors:
+    - name: "The ThetaScan Project"

@@ -1,0 +1,33 @@
+# Python and build products
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+tmp/
+
+# Local environments and editor/agent state
+.venv/
+venv/
+.env
+.env.*
+.claude/
+.codex/
+.agents/
+
+# Training artifacts and credentials
+remote_results/
+runs/
+outputs/
+checkpoints/
+wandb/
+*.pt
+*.pth
+*.ptz
+*.safetensors
+*.ckpt
+*.key
+benchmarks/parameter-golf/results/_local/

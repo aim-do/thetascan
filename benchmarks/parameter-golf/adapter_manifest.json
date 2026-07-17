@@ -1,0 +1,100 @@
+{
+  "schema_version": 1,
+  "official_parameter_golf": {
+    "repository": "https://github.com/openai/parameter-golf.git",
+    "revision": "f5c079314c4877fbb0af378c0abade5a8ca33d3a",
+    "path": "train_gpt.py",
+    "blob_sha1": "651beb2b895c3ff8ba4a232914d8b3772baaa868",
+    "data_downloader_path": "data/cached_challenge_fineweb.py",
+    "data_downloader_blob_sha1": "fa8029be4201707bb11cd61ba1027d5905d91e1c"
+  },
+  "dataset_reference": {
+    "repository": "willdepueoai/parameter-golf",
+    "revision": "a85b0e6035c3c94bc23685a07c81a8f3bf89db80",
+    "license": "ODC-By-1.0",
+    "license_url": "https://opendatacommons.org/licenses/by/1-0/",
+    "common_crawl_terms_url": "https://commoncrawl.org/terms-of-use",
+    "remote_root_prefix": "datasets",
+    "manifest_path": "datasets/manifest.json",
+    "manifest_etag": "4f5ae3113366f06b4ca0f005f0afabaef0d2da01"
+  },
+  "mamba3_reference": {
+    "repository": "https://github.com/state-spaces/mamba.git",
+    "tag": "v2.3.2.post1",
+    "revision": "a14b1dff0454a3bc27d9eb31355dc01e4b2490ec",
+    "module": "mamba_ssm.modules.mamba3.Mamba3",
+    "source_path": "mamba_ssm/modules/mamba3.py",
+    "source_sha256": "de1b104865c941eb6eeac63c3a75d5913fc2e7a119d52991590ef19c381b05ac"
+  },
+  "generated_entrypoint": "ours/train_gpt_hybrid.py",
+  "adapter_module": "ours/thetascan_benchmark_adapter.py",
+  "data_downloader": "ours/download_data.py",
+  "generated_file_licenses": {
+    "ours/train_gpt_hybrid.py": "MIT",
+    "ours/download_data.py": "MIT",
+    "ours/thetascan_benchmark_adapter.py": "PolyForm-Small-Business-1.0.0"
+  },
+  "default_swapped_layers": [4, 5],
+  "default_full_ffn_hidden": 1024,
+  "mamba3_parity_ffn_hidden": 938,
+  "mamba3_mixer_shape": {
+    "d_state": 64,
+    "headdim": 64,
+    "expand": 1.0,
+    "rope_fraction": 0.5,
+    "chunk_size": 64,
+    "ngroups": 1,
+    "is_outproj_norm": true,
+    "is_mimo": false
+  },
+  "expected_mamba3_parity_delta": {
+    "mixer_two_blocks": 175376,
+    "ffn_two_blocks": -176128,
+    "net": -752,
+    "target_approx_model_percent": -0.0044,
+    "pinned_attention_model_params": 17059912,
+    "pinned_mamba3_model_params": 17059160,
+    "pinned_model_percent": -0.00440799460161342
+  },
+  "expected_theta_profiles": {
+    "mamba-shared": {
+      "swapped_ffn_hidden": 1023,
+      "model_params": 17059928,
+      "model_delta_vs_attention": 16,
+      "muon_2d_tensor_count": 54,
+      "muon_2d_parameter_count": 16119808,
+      "theta_candidate_parameter_count": 393216,
+      "theta_control_parameter_count": 2080,
+      "adam_block_and_skip_tensor_count_with_theta_muon": 41,
+      "adam_block_and_skip_parameter_count_with_theta_muon": 22616,
+      "adam_block_and_skip_tensor_count_without_theta_muon": 45,
+      "adam_block_and_skip_parameter_count_without_theta_muon": 415832
+    },
+    "transformer-gqa": {
+      "swapped_ffn_hidden": 832,
+      "model_params": 17059928,
+      "model_delta_vs_attention": 16,
+      "muon_2d_tensor_count": 54,
+      "muon_2d_parameter_count": 16121856,
+      "theta_candidate_parameter_count": 393216,
+      "theta_control_parameter_count": 32,
+      "adam_block_and_skip_tensor_count_with_theta_muon": 39,
+      "adam_block_and_skip_parameter_count_with_theta_muon": 20568,
+      "adam_block_and_skip_tensor_count_without_theta_muon": 43,
+      "adam_block_and_skip_parameter_count_without_theta_muon": 413784
+    },
+    "independent": {
+      "swapped_ffn_hidden": 576,
+      "model_params": 17059928,
+      "model_delta_vs_attention": 16,
+      "muon_2d_tensor_count": 50,
+      "muon_2d_parameter_count": 16121856,
+      "theta_candidate_parameter_count": 393216,
+      "theta_control_parameter_count": 32,
+      "adam_block_and_skip_tensor_count_with_theta_muon": 39,
+      "adam_block_and_skip_parameter_count_with_theta_muon": 20568,
+      "adam_block_and_skip_tensor_count_without_theta_muon": 43,
+      "adam_block_and_skip_parameter_count_without_theta_muon": 413784
+    }
+  }
+}

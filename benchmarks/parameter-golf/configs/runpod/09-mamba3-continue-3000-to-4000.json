@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "suite_id": "public-h100-mamba3-continuation-4000-v1",
+  "description": "Exact continuation of the Mamba-3 parity checkpoint from step 3000 through step 4000 on the 7500-step full-learning-rate schedule.",
+  "seed_policy": "explicit_shared_across_pods",
+  "hardware": {"gpu_count": 1, "gpu_type": "NVIDIA H100 80GB HBM3"},
+  "launcher": {"hard_timeout_seconds": 3600, "result_grace_seconds": 300, "max_budget_usd": 3.25},
+  "data": {"variant": "sp1024", "train_shards": 21},
+  "protocols": {
+    "smoke": {"iterations": 7500, "segment_start_step": 3000, "segment_end_step": 3020, "val_start_step": 3020, "val_every": 20, "warmup_steps": 20, "warmdown_iters": 750, "max_wallclock_seconds": 0.0, "timeout_seconds": 900, "checkpoint_at_end": true},
+    "production": {"iterations": 7500, "segment_start_step": 3020, "segment_end_step": 4000, "val_start_step": 3250, "val_every": 250, "warmup_steps": 20, "warmdown_iters": 750, "max_wallclock_seconds": 0.0, "timeout_seconds": 1800, "checkpoint_at_end": true}
+  },
+  "runs": [{
+    "id": "mamba3-parity",
+    "arm": "mamba3",
+    "rope": "partial",
+    "backend": "quad",
+    "projection_layout": "mamba-shared",
+    "optimizer_policy": "muon-2d",
+    "expected_model_params": 17059160,
+    "artifact_cap_bytes": 16000000,
+    "required_log_regex": ["mixer_impl:Mamba3", "model_params:17059160", "mamba3_block_parity:.*net_delta:-752", "resume_loaded:.*step:(3000|3020)", "final_int8_zlib_roundtrip_exact", "Total submission size int8\\+zlib: [0-9]+ bytes"]
+  }]
+}

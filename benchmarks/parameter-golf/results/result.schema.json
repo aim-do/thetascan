@@ -1,0 +1,143 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aim.do/thetascan/schemas/parameter-golf-suite-result-v1.json",
+  "title": "ThetaScan parameter-golf suite result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "suite_id",
+    "status",
+    "runtime_seed",
+    "started_at",
+    "finished_at",
+    "source_snapshot",
+    "adapter_manifest_sha256",
+    "protocols",
+    "runs"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "suite_id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]*$" },
+    "status": { "enum": ["passed", "failed"] },
+    "runtime_seed": { "type": "integer", "minimum": 0, "maximum": 2147483646 },
+    "started_at": { "type": "string", "format": "date-time" },
+    "finished_at": { "type": "string", "format": "date-time" },
+    "source_snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["payload_sha256", "git_revision", "git_dirty"],
+      "properties": {
+        "payload_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "git_revision": { "type": ["string", "null"] },
+        "git_dirty": { "type": ["boolean", "null"] }
+      }
+    },
+    "adapter_manifest_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "protocols": { "type": "object" },
+    "runs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "stage",
+          "status",
+          "arm",
+          "recipe",
+          "rope",
+          "backend",
+          "projection_layout",
+          "optimizer_policy",
+          "return_code",
+          "elapsed_seconds",
+          "assertions",
+          "metrics",
+          "log"
+        ],
+        "properties": {
+          "id": { "type": "string" },
+          "stage": { "enum": ["smoke", "production"] },
+          "status": { "enum": ["passed", "failed"] },
+          "arm": { "enum": ["attention", "thetascan", "mamba3"] },
+          "recipe": {
+            "enum": [
+              null,
+              "gn-reference-v0.1",
+              "gn-expanded-reference-v0.1",
+              "kernel-expanded-reference-v0.1"
+            ]
+          },
+          "rope": { "enum": ["none", "partial", "full"] },
+          "backend": { "enum": ["auto", "naive", "quad", "cumsum", "fla"] },
+          "projection_layout": {
+            "enum": ["mamba-shared", "transformer-gqa", "independent"]
+          },
+          "optimizer_policy": { "enum": ["muon-2d", "muon-2d+theta"] },
+          "return_code": { "type": ["integer", "null"] },
+          "elapsed_seconds": { "type": "number", "minimum": 0 },
+          "assertions": {
+            "type": "object",
+            "required": ["passed", "missing_patterns"],
+            "properties": {
+              "passed": { "type": "boolean" },
+              "missing_patterns": { "type": "array", "items": { "type": "string" } }
+            }
+          },
+          "metrics": {
+            "type": "object",
+            "required": [
+              "artifact_bytes",
+              "artifact_cap_bytes",
+              "artifact_within_cap",
+              "final_int8_roundtrip_exact",
+              "artifact_file_present_before_delete"
+            ],
+            "properties": {
+              "artifact_bytes": {"type": ["integer", "null"], "minimum": 0},
+              "artifact_cap_bytes": {"const": 16000000},
+              "artifact_within_cap": {"type": "boolean"},
+              "final_int8_roundtrip_exact": {"type": "boolean"},
+              "artifact_file_present_before_delete": {"type": "boolean"}
+            }
+          },
+          "log": { "type": "string" },
+          "error": { "type": ["string", "null"] }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": { "arm": { "const": "thetascan" } },
+              "required": ["arm"]
+            },
+            "then": {
+              "properties": {
+                "recipe": {
+                  "enum": [
+                    "gn-reference-v0.1",
+                    "gn-expanded-reference-v0.1",
+                    "kernel-expanded-reference-v0.1"
+                  ]
+                }
+              }
+            },
+            "else": { "properties": { "recipe": { "type": "null" } } }
+          }
+        ]
+      }
+    },
+    "error": { "type": ["string", "null"] }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "status": { "const": "passed" } },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": { "runs": { "minItems": 1 } }
+      }
+    }
+  ]
+}

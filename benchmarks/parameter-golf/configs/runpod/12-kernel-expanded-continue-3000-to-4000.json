@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "suite_id": "public-h100-kernel-expanded-continuation-4000-v1",
+  "description": "Exact continuation of the kernel expanded reference checkpoint from step 3000 through step 4000 (research-only oversize artifact).",
+  "seed_policy": "explicit_shared_across_pods",
+  "hardware": {
+    "gpu_count": 1,
+    "gpu_type": "NVIDIA H100 80GB HBM3"
+  },
+  "launcher": {
+    "hard_timeout_seconds": 4800,
+    "result_grace_seconds": 300,
+    "max_budget_usd": 4.25
+  },
+  "data": {
+    "variant": "sp1024",
+    "train_shards": 21
+  },
+  "protocols": {
+    "smoke": {
+      "iterations": 7500,
+      "segment_start_step": 3000,
+      "segment_end_step": 3020,
+      "val_start_step": 3020,
+      "val_every": 20,
+      "warmup_steps": 20,
+      "warmdown_iters": 750,
+      "max_wallclock_seconds": 0.0,
+      "timeout_seconds": 900,
+      "checkpoint_at_end": true,
+      "research_allow_oversize_artifact": true
+    },
+    "production": {
+      "iterations": 7500,
+      "segment_start_step": 3020,
+      "segment_end_step": 4000,
+      "val_start_step": 3250,
+      "val_every": 250,
+      "warmup_steps": 20,
+      "warmdown_iters": 750,
+      "max_wallclock_seconds": 0.0,
+      "timeout_seconds": 2700,
+      "checkpoint_at_end": true,
+      "research_allow_oversize_artifact": true
+    }
+  },
+  "runs": [
+    {
+      "id": "kernel-expanded-3000",
+      "arm": "thetascan",
+      "recipe": "kernel-expanded-reference-v0.1",
+      "rope": "partial",
+      "backend": "quad",
+      "projection_layout": "mamba-shared",
+      "optimizer_policy": "muon-2d+theta",
+      "expected_model_params": 17059976,
+      "artifact_cap_bytes": 16000000,
+      "required_log_regex": [
+        "mixer_impl:ThetaScan",
+        "model_params:17059976",
+        "theta_projection_layout:mamba-shared",
+        "optimizer_adam_theta_controls:tensor_count=8 parameter_count=2128",
+        "thetascan_config:.*'family': 'kernel'",
+        "thetascan_config:.*'feature_map': 'relu2_ridge'.*'relu2_threshold_mode': 'learned_per_head'",
+        "thetascan_config:.*'feature_expansion': 2",
+        "thetascan_config:.*'temporal': {'mode': 'bank'.*'recency_branches': 2.*'half_life_inits': \\(8\\.0, 64\\.0\\).*'blend_mode': 'free'",
+        "kernel_relu2_threshold_per_head:",
+        "bank_timescales_per_head:.*\"alpha\":\\[.*\"eta\":\\[.*\"half_life\":\\[",
+        "ffn_hidden:full=1024 .*thetascan=1023",
+        "resume_loaded:.*step:(3000|3020)",
+        "final_int8_zlib_roundtrip_exact",
+        "Total submission size int8\\+zlib: [0-9]+ bytes"
+      ],
+      "expected_theta_headwise_muon_tensors": 4,
+      "expected_theta_headwise_muon_params": 393216
+    }
+  ]
+}

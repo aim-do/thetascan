@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "suite_id": "public-h100-continuation-4000-to-7500-v1",
+  "protocol": {
+    "seed": 1661305741,
+    "dataset": "FineWeb10B_sp1024",
+    "train_shards": 40,
+    "sequence_length": 1024,
+    "batch_tokens": 524288,
+    "schedule_target_steps": 7500,
+    "resume_step": 4000,
+    "resume_smoke_end_step": 4020,
+    "production_end_step": 7500,
+    "production_validation_steps": [
+      4250,
+      4500,
+      4750,
+      5000,
+      5250,
+      5500,
+      5750,
+      6000,
+      6250,
+      6500,
+      6750,
+      7000,
+      7250,
+      7500
+    ],
+    "warmdown_steps": 750,
+    "warmdown_start_step": 6750
+  },
+  "host": {
+    "d_model": 512,
+    "query_heads": 8,
+    "key_value_heads": 4,
+    "vocabulary_size": 1024,
+    "full_ffn_hidden": 1024,
+    "swapped_layers": [
+      4,
+      5
+    ]
+  },
+  "optimizer_policies": {
+    "attention": "muon-2d",
+    "mamba3-parity": "muon-2d",
+    "thetascan_arms": "muon-2d+theta",
+    "note": "The two baselines use the host benchmark's muon-2d policy. Every ThetaScan arm uses muon-2d+theta, which additionally routes the memory factors W1/W2 through batched per-head Muon. Comparisons are therefore architecture-plus-policy pairs, not a pure mixer swap under one optimizer."
+  },
+  "arms": [
+    {
+      "id": "attention",
+      "optimizer_policy": "muon-2d",
+      "parameters": 17059912
+    },
+    {
+      "id": "gn-reference",
+      "public_recipe": "gn-reference-v0.1",
+      "optimizer_policy": "muon-2d+theta",
+      "parameters": 17059928,
+      "ffn_hidden": 1023
+    },
+    {
+      "id": "gn-expanded-reference",
+      "public_recipe": "gn-expanded-reference-v0.1",
+      "optimizer_policy": "muon-2d+theta",
+      "parameters": 17059928,
+      "ffn_hidden": 1020,
+      "artifact_over_cap_bytes": 36604
+    },
+    {
+      "id": "kernel-expanded-reference",
+      "public_recipe": "kernel-expanded-reference-v0.1",
+      "optimizer_policy": "muon-2d+theta",
+      "parameters": 17059976,
+      "ffn_hidden": 1023,
+      "artifact_over_cap_bytes": 12318
+    },
+    {
+      "id": "mamba3-parity",
+      "optimizer_policy": "muon-2d",
+      "parameters": 17059160,
+      "ffn_hidden": 938
+    }
+  ],
+  "expansion_note": "The expanded arms were measured with fixed expansion maps drawn from the research key namespace. The public implementation derives its maps from the documented expansion_key namespace, so a new repetition uses statistically equivalent but not bitwise-identical fixed maps.",
+  "source_snapshot_distributed": false
+}
