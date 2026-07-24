@@ -508,7 +508,18 @@ class RunPodLauncherTests(unittest.TestCase):
                             ("--resume-checkpoint", str(checkpoint))
                         )
                     output = io.StringIO()
-                    with contextlib.redirect_stdout(output):
+                    # This test validates the checked-in configuration guards,
+                    # not host SSH-key discovery.  Keep it hermetic on clean CI
+                    # runners, where ``auto`` would otherwise select the legacy
+                    # environment transport and correctly reject continuations.
+                    with (
+                        mock.patch.object(
+                            runpod,
+                            "_select_bootstrap_transport",
+                            return_value=("ssh", "unit-test transport"),
+                        ),
+                        contextlib.redirect_stdout(output),
+                    ):
                         runpod.main(arguments)
                     preview = json.loads(output.getvalue())
                     self.assertGreaterEqual(preview["setup_headroom_seconds"], 0)
