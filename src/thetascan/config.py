@@ -440,7 +440,11 @@ class RuntimeConfig:
     ``scan_chunk`` tunes the ``chunk`` tile.  Retained bytes are
     ``T * scan_chunk`` for the score tiles and ``(T / scan_chunk) * Dk * Dv``
     for the carried states, so the footprint minimum is near
-    ``sqrt(Dk * Dv)``; the default suits the reference memory width.  Other
+    ``sqrt(Dk * Dv)``; the default suits the reference memory width.  Raising
+    it buys nothing: the backend issues every tile in one batched call, so the
+    tile size does not affect how many operations a scan costs, while the
+    ``T * scan_chunk`` score term makes a larger tile cost both time and
+    memory.  Lower it toward ``sqrt(Dk * Dv)`` if memory is binding.  Other
     backends ignore it.
     """
 

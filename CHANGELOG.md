@@ -9,6 +9,54 @@ Execution-only work. No algorithm, parameterization, preset, or checkpoint
 contract changed, and no result in `benchmarks/parameter-golf/results/` is
 affected.
 
+- **Fixed long-context rotary positions.** The RoPE table formed its position
+  indices in the activation dtype. A bfloat16 `arange` stops resolving adjacent
+  integers above 256, so past that length neighbouring positions shared a phase
+  before the sine was evaluated and the rotation carried no relative
+  information at exactly the lengths it exists for. Positions and trigonometry
+  are now formed in float32 (float64 for a float64 caller) and only the
+  finished rotations are cast. The table is also memoized, since one forward
+  requests the same immutable table once per query, key, layer and checkpoint
+  recomputation.
+- **The `chunk` backend issues every tile in one batched call.** It previously
+  walked its tiles in Python, so the operation count grew as `T / scan_chunk`
+  and, at long context with small per-tile tensors, wall time tracked that
+  count rather than the arithmetic. The tiles are now a leading batch axis of
+  one `[B, H, T / scan_chunk, scan_chunk, scan_chunk]` score, and the
+  cross-chunk state is computed in parallel for both promoted temporal views:
+  the plain sum is an exclusive cumulative sum over the tile axis, and a static
+  per-head retention is the same sum against a fixed geometric weight over that
+  axis. A per-token retention stream keeps its sequential state, because the
+  parallel alternative materializes the reciprocal decay this backend refuses
+  to form. Semantics are unchanged -- bitwise identical for the sum and
+  per-token views, `1.5e-16` for a static retention, worst gradient `3.6e-16`,
+  and `scan_chunk >= T` still reproduces `quad` bit for bit. Two consequences:
+  the largest retained tensor is now the whole tiled score rather than one tile
+  (the same total bytes, still linear in `T`, in one allocation), and raising
+  `scan_chunk` no longer buys anything, because it was never a launch-count
+  knob after this and the `T * scan_chunk` score term makes a larger tile cost
+  both time and memory.
+- **A normalized read no longer forms a separate key mass.** The denominator
+  `q . sum_j omega_j k_j` was built as a running `[B, H, T, m]` cumulative sum
+  over a non-innermost axis, which scans the whole sequence over only
+  `B * H * m` lanes -- and duplicates a prefix the scan beside it already
+  computes. It now rides that scan as one extra unit-valued payload column, so
+  every temporal view keeps exactly the mass it had: sum, EMA, the stale
+  difference of a bank, and zero for the zero-memory base read. Per-feature
+  normalization divides the query by the mass before the scan and therefore
+  cannot fold; its prefix sum now moves `T` to the innermost axis so it uses
+  the parallel per-row scan. Verified against the brute-force oracle in
+  float64 for the sum, EMA, and both bank views. In reduced precision the
+  denominator's rounding changes: it accumulates through the scan's float32
+  cross-chunk state and bfloat16 tile matmul instead of a separate float32
+  prefix followed by a bfloat16 dot.
+- Documented that `torch.compile` and `torch.utils.checkpoint` do not compose
+  here. Compiling a model whose residual blocks are activation checkpointed
+  leaves the elementwise work unfused and measured as a complete no-op; the two
+  levers only pay together. Nothing in the library changed for this -- it is a
+  property of how a caller assembles the surrounding model -- but the previous
+  note claiming compilation could not close the tile-loop gap is no longer the
+  relevant statement, because there is no tile loop.
 - Added the `chunk` scan backend and the `RuntimeConfig.scan_chunk` tile size.
   It forms the causal score one `[scan_chunk, scan_chunk]` tile at a time and
   carries an explicit `[Dk, Dv]` state between tiles, so activations grow

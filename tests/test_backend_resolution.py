@@ -26,13 +26,14 @@ class BackendResolutionTests(unittest.TestCase):
                 self.assertEqual(resolve_backend("auto", device="cuda"), "chunk")
 
     def test_auto_never_selects_fla_for_any_temporal_mode(self) -> None:
-        """FLA refuses its gated backward for a retention, and loses compiled.
+        """FLA refuses its gated backward for a retention, and loses anyway.
 
         Its chunked gated backward is refused for any retention on Hopper with
         Triton >= 3.4, so every reference preset would fail on its first
-        backward. For the ungated plain sum it does support, a compiled model
-        breaks into several graphs around its compiler-disabled wrapper and
-        measured slower than the portable tile.
+        backward. For the ungated plain sum it does support, it measured slower
+        than the portable tile: a compiled model breaks into several graphs
+        around its compiler-disabled wrapper, and substituting the scan leaves
+        the rest of a long-context read untouched.
         """
         with (
             mock.patch.object(torch.cuda, "is_available", return_value=True),

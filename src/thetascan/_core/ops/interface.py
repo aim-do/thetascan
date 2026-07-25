@@ -25,11 +25,12 @@ def resolve_backend(
     ``auto`` deliberately never selects FLA, for two measured reasons.  Its
     chunked gated backward is refused outright for any retention on Hopper with
     Triton >= 3.4, so every reference preset would fail on its first backward.
-    And for the one case it does support, the ungated plain sum, its kernel
-    wrapper is closed to the compiler: a compiled model breaks into several
-    graphs around it and measured slower than the portable tile at every length
-    tried, while also holding more memory at short context.  FLA stays available
-    as an explicit choice for an eager long-sequence plain sum.
+    And for the one case it does support, the ungated plain sum, it is slower
+    than the portable tile at every length tried while holding more memory at
+    short context: its kernel wrapper is closed to the compiler, so a compiled
+    model breaks into several graphs around it, and replacing the scan does not
+    address what a long-context read actually spends its time on.  FLA stays
+    available as an explicit choice for an eager long-sequence plain sum.
 
     A caller who wants the legacy execution contract asks for ``quad``.
     """
