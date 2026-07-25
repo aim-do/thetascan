@@ -21,19 +21,40 @@ the states, so the footprint minimum sits near ``chunk = sqrt(Dk * Dv)``: 111 to
 158 across the reference widths.  Sequence length does not move that optimum,
 and both terms are linear in ``T`` rather than quadratic.
 
-The default of 512 is deliberately above that footprint optimum.  Measured on an
-H100 in bfloat16, small tiles lose badly to per-tile launch overhead, and
-``torch.compile`` does not close that gap; a small tile also raises compile time,
-because the loop unrolls statically.  The footprint reduction holds at every
-length -- 1.17x-1.54x at ``T=1024`` and 2.80x-3.82x at ``T=4096``.  Lower
-``scan_chunk`` toward ``sqrt(Dk * Dv)`` only when memory is the binding
-constraint.
+Every tile is issued at once, not in a Python loop.  The tiles are a leading
+batch axis of one ``[B, H, T/chunk, chunk, chunk]`` score, so the whole scan is
+a handful of batched matmuls plus one scan over the tile axis, whatever the
+sequence length.  That matters because the per-tile work at the reference width
+is far below what one GPU can execute concurrently: a loop over 256 tiles of a
+131,072-token sequence issues thousands of kernels that each leave the device
+mostly idle, and wall time then tracks the dispatch count rather than the
+arithmetic.  Batching also makes ``scan_chunk`` a throughput knob rather than a
+launch-count knob, so it can be raised to trade the ``T * chunk`` score term
+against nothing but memory.
+
+The tile axis carries the cross-chunk state, and for the two promoted temporal
+views that recurrence is associative, so it is computed in parallel rather than
+stepped:
+
+* plain sum -- ``S_n = sum_{j<n} U_j`` is an exclusive cumulative sum;
+* static per-head retention -- ``S_n = sum_{j<n} alpha^(chunk (n-1-j)) U_j`` is
+  the same sum against a fixed geometric Toeplitz weight over the tile axis,
+  which is tiny because there are ``T/chunk`` tiles, not ``T`` tokens.
+
+A per-token retention stream has a data-dependent closing factor per tile, so
+its state is still stepped over the tile axis -- but only the state is, at two
+operations per tile instead of a full tile of work, and every score, payload and
+cross term stays batched.  Stepping it keeps the guarantee that no ``1/alpha^i``
+factor is ever materialized, which is what a log-space parallel form would give
+up.
 
 A single tile is not a wasted case.  At ``chunk >= T`` this backend still beats
 ``quad`` on the retained views, because a static retention builds one
 ``[1, H, T, T]`` weight shared across the batch where ``quad`` builds
 ``[B, H, T, T]`` from a per-token cumulative sum, and because a triangular
-select replaces an explicit boolean mask tensor.
+select replaces an explicit boolean mask tensor.  That case also needs no tile
+axis at all, so it is evaluated directly and stays bit-for-bit identical to
+``quad``.
 
 Retention handling matches :mod:`scan_quad` structurally: a weight is always the
 DIFFERENCE of cumulative logs clamped at zero before ``exp``, so no ``1/alpha^i``
@@ -80,34 +101,112 @@ def _static_weights(
     return tile, carry
 
 
-def _view_weights(
+def _tile_weights(
     retention: torch.Tensor | None,
     *,
-    start: int,
+    tiles: int,
     width: int,
     heads: int,
     static: tuple[torch.Tensor, torch.Tensor] | None,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     """Return this view's intra-tile weight and incoming-state carry.
 
+    Both are shaped to broadcast against a tiled ``[B,H,NT,C,*]`` stream.
     ``None`` for both means the plain causal sum, where every retained weight is
-    exactly one.  A static per-head retention reuses one batch-independent
-    Toeplitz tile; a per-token stream builds its own from the tile-local
-    cumulative log, which is the same construction the quadratic backend uses.
+    exactly one.  A static per-head retention reuses one batch- and
+    tile-independent Toeplitz tile; a per-token stream builds its own from the
+    tile-local cumulative log, which is the same construction the quadratic
+    backend uses.
     """
     if retention is None:
         return None, None
     if static is not None:
         tile, carry = static
         return (
-            tile[:, :width, :width].unsqueeze(0),
-            carry[:, :width].reshape(1, heads, width, 1),
+            tile.view(1, heads, 1, width, width),
+            carry.view(1, heads, 1, width, 1),
         )
-    local = retention[:, :, start:start + width, 0].cumsum(-1)      # [B,H,C]
+    local = retention.view(-1, heads, tiles, width).cumsum(-1)      # [B,H,NT,C]
     tile = (
         local.unsqueeze(-1) - local.unsqueeze(-2)
-    ).clamp(max=0.0).exp()                                          # [B,H,C,C]
+    ).clamp(max=0.0).exp()                                          # [B,H,NT,C,C]
     return tile, local.exp().unsqueeze(-1)
+
+
+def _pad_tiles(x: torch.Tensor, pad: int) -> torch.Tensor:
+    """Zero-extend along T so every tile is full width.
+
+    Padded keys and values contribute nothing to any score, payload or state,
+    and padded queries only produce output rows that the caller slices away.
+    """
+    if pad == 0:
+        return x
+    tail = x.new_zeros(*x.shape[:2], pad, *x.shape[3:])
+    return torch.cat([x, tail], dim=2)
+
+
+def _tile_states(
+    update: torch.Tensor,
+    *,
+    retention: torch.Tensor | None,
+    static_log_alpha: torch.Tensor | None,
+    closing: torch.Tensor | None,
+    width: int,
+) -> torch.Tensor:
+    """Exclusive scan of per-tile updates: ``S_n = sum_{j<n} decay(n,j) U_j``.
+
+    ``update`` is ``[B,H,NT,Dk,Dv]``.  The plain sum and the static retention
+    are associative in closed form and are evaluated in parallel; a per-token
+    stream keeps the sequential recurrence, because the alternative is a
+    log-space form that materializes the reciprocal decay this module refuses to
+    form.
+    """
+    tiles = update.shape[2]
+    if retention is None:
+        # Exclusive prefix sum: subtracting the inclusive scan's own term is one
+        # kernel and avoids a shifted copy.
+        return update.cumsum(2) - update
+    if static_log_alpha is not None:
+        # One [H,NT,NT] geometric weight over the tile axis.  Exponents are
+        # clamped before exp, so a small alpha cannot overflow, and the strictly
+        # lower triangle keeps the scan exclusive.
+        index = torch.arange(tiles, device=update.device, dtype=update.dtype)
+        exponent = (index.view(tiles, 1) - index.view(1, tiles) - 1.0).clamp(min=0.0)
+        la = static_log_alpha.to(device=update.device, dtype=update.dtype)
+        weight = torch.exp(la.reshape(-1, 1, 1) * float(width) * exponent).tril(-1)
+        return torch.einsum("hnj,bhjkv->bhnkv", weight, update)
+    assert closing is not None
+    states = [torch.zeros_like(update[:, :, 0])]
+    for index in range(tiles - 1):
+        states.append(states[-1] * closing[:, :, index] + update[:, :, index])
+    return torch.stack(states, dim=2)
+
+
+def _single_tile(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    retentions: tuple[torch.Tensor | None, ...],
+    statics: list[tuple[torch.Tensor, torch.Tensor] | None],
+) -> tuple[torch.Tensor, ...]:
+    """The ``chunk >= T`` case, evaluated without a tile axis.
+
+    Keeping this path in the untiled shape is what makes the single-tile result
+    bit-for-bit identical to :mod:`scan_quad`, which is the documented contract.
+    """
+    scores = q @ k.transpose(-1, -2)
+    outputs = []
+    for retention, static in zip(retentions, statics):
+        if retention is None:
+            tile = None
+        elif static is not None:
+            tile = static[0].unsqueeze(0)
+        else:
+            local = retention[..., 0].cumsum(-1)
+            tile = (local.unsqueeze(-1) - local.unsqueeze(-2)).clamp(max=0.0).exp()
+        weighted = scores if tile is None else scores * tile
+        outputs.append(weighted.tril() @ v)
+    return tuple(outputs)
 
 
 def linattn_views(
@@ -137,8 +236,9 @@ def linattn_views(
         raise ValueError("chunk backend: chunk must be >= 1")
     if not retentions:
         return ()
-    heads, T = q.shape[1], q.shape[2]
-    width0 = min(chunk, T)
+    B, heads, T = q.shape[0], q.shape[1], q.shape[2]
+    width = min(chunk, T)
+    tiles = -(-T // width)
 
     statics: list[tuple[torch.Tensor, torch.Tensor] | None] = []
     for retention in retentions:
@@ -154,54 +254,54 @@ def linattn_views(
                 "chunk backend: a static retention needs one entry per head, "
                 f"got {tuple(retention.shape)} for q {tuple(q.shape)}"
             )
-        statics.append(_static_weights(retention, width0, q.dtype, q.device))
+        statics.append(_static_weights(retention, width, q.dtype, q.device))
 
+    if tiles == 1:
+        return _single_tile(q, k, v, retentions, statics)
+
+    pad = tiles * width - T
+    qt = _pad_tiles(q, pad).view(B, heads, tiles, width, -1)
+    kt = _pad_tiles(k, pad).view(B, heads, tiles, width, -1)
+    vt = _pad_tiles(v, pad).view(B, heads, tiles, width, -1)
+    scores = qt @ kt.transpose(-1, -2)          # formed once for all views
     state_dtype = torch.promote_types(q.dtype, torch.float32)
-    outputs: list[list[torch.Tensor]] = [[] for _ in retentions]
-    states: list[torch.Tensor | None] = [None] * len(retentions)
+    plain_update: torch.Tensor | None = None
 
-    for start in range(0, T, chunk):
-        stop = min(T, start + chunk)
-        width = stop - start
-        qc = q[:, :, start:stop]
-        kc = k[:, :, start:stop]
-        vc = v[:, :, start:stop]
-        scores = qc @ kc.transpose(-1, -2)          # formed once for all views
+    outputs = []
+    for index, retention in enumerate(retentions):
+        stream = None
+        if retention is not None and statics[index] is None:
+            stream = _pad_tiles(retention, pad)
+        tile, carry = _tile_weights(
+            stream if stream is not None else retention,
+            tiles=tiles, width=width, heads=heads, static=statics[index],
+        )
+        weighted = scores if tile is None else scores * tile
+        out = weighted.tril() @ vt
 
-        for index, retention in enumerate(retentions):
-            tile, carry = _view_weights(
-                retention, start=start, width=width, heads=heads,
-                static=statics[index],
-            )
-            weighted = scores if tile is None else scores * tile
-            out = weighted.tril() @ vc
-            state = states[index]
-            if state is not None:
-                cross = qc @ state.to(qc.dtype)
-                out = out + (
-                    cross if carry is None else cross * carry.to(out.dtype)
-                )
-            outputs[index].append(out)
+        if tile is None:
+            if plain_update is None:
+                plain_update = (kt.transpose(-1, -2) @ vt).to(state_dtype)
+            update = plain_update
+        else:
+            # The weight of key j in the state leaving a tile is
+            # alpha^(width - 1 - j): the last row of that tile's intra weight.
+            keyed = kt * tile[..., width - 1, :].unsqueeze(-1).to(kt.dtype)
+            update = (keyed.transpose(-1, -2) @ vt).to(state_dtype)
+        states = _tile_states(
+            update,
+            retention=retention,
+            static_log_alpha=None if statics[index] is None else retention,
+            # carry at the last local position is alpha^width: the whole tile's
+            # retention applied to everything already stored.
+            closing=None if carry is None else carry[:, :, :, width - 1:width],
+            width=width,
+        )
+        cross = qt @ states.to(qt.dtype)
+        out = out + (cross if carry is None else cross * carry.to(out.dtype))
+        outputs.append(out.reshape(B, heads, tiles * width, -1)[:, :, :T])
 
-            if stop < T:
-                # The weight of key j in the state leaving this tile is
-                # alpha^(width - 1 - j): the last row of the intra tile.
-                keyed = kc if tile is None else kc * tile[
-                    :, :, width - 1, :
-                ].unsqueeze(-1).to(kc.dtype)
-                update = (keyed.transpose(-1, -2) @ vc).to(state_dtype)
-                if state is None:
-                    states[index] = update
-                elif carry is None:
-                    states[index] = state + update
-                else:
-                    # carry at the last local position is alpha^width: the whole
-                    # tile's retention applied to everything already stored.
-                    # Keep the sliced axis so it broadcasts over [B,H,Dk,Dv].
-                    closing = carry[:, :, width - 1: width, :].to(state_dtype)
-                    states[index] = state * closing + update
-
-    return tuple(torch.cat(chunks, dim=2) for chunks in outputs)
+    return tuple(outputs)
 
 
 def linattn(

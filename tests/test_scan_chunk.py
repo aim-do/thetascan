@@ -199,8 +199,18 @@ class ChunkedScanFootprintTests(unittest.TestCase):
             fn(q, k, v)
         return saved
 
-    def test_the_largest_retained_tensor_is_a_tile_not_the_score(self) -> None:
+    def test_the_largest_retained_tensor_is_tiled_not_quadratic(self) -> None:
+        """Retained bytes must scale with ``T * chunk``, never with ``T * T``.
+
+        Every tile is issued in one batched call, so the largest retained tensor
+        is the whole ``[B,H,T/chunk,chunk,chunk]`` score rather than a single
+        ``[B,H,chunk,chunk]`` tile.  That is the same total -- the loop retained
+        one tile per iteration -- in one allocation instead of ``T/chunk`` of
+        them, and it is still linear in sequence length, which is the property
+        this backend exists for.
+        """
         shape = self.SHAPE
+        chunk = 64
         log_alpha = torch.full((shape["H"],), -0.1)
         quad = self._saved(
             lambda q, k, v: scan_quad.linattn(
@@ -209,14 +219,14 @@ class ChunkedScanFootprintTests(unittest.TestCase):
         )
         chunked = self._saved(
             lambda q, k, v: scan_chunk.linattn(
-                q, k, v, chunk=64, log_alpha=log_alpha
+                q, k, v, chunk=chunk, log_alpha=log_alpha
             )
         )
-        score_bytes = (
-            shape["B"] * shape["H"] * shape["T"] * shape["T"] * 4
-        )
+        score_bytes = shape["B"] * shape["H"] * shape["T"] * shape["T"] * 4
+        tiled_bytes = shape["B"] * shape["H"] * shape["T"] * chunk * 4
         self.assertGreaterEqual(quad.largest, score_bytes)
-        self.assertLess(chunked.largest, score_bytes // 8)
+        self.assertLessEqual(chunked.largest, tiled_bytes)
+        self.assertLess(chunked.largest, score_bytes)
         self.assertLess(chunked.total, quad.total)
 
     def test_the_footprint_grows_linearly_in_sequence_length(self) -> None:
