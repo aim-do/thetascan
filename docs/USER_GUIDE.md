@@ -343,10 +343,11 @@ allocation, optimizer policy, and schedule. See
   reference presets (see [API.md](API.md#runtimeconfig)). No wall-time
   comparison is published for the backends; compile first, then measure your
   own configuration with `benchmarks/scan_backends.py`.
-- `chunk` is still a loop of PyTorch matmuls: a dedicated fused kernel is needed
-  before making any wall-clock scaling claim, small tiles remain launch-bound
-  whether compiled or not, and a small tile also raises compile time because
-  the loop unrolls statically.
+- `chunk` is still ordinary PyTorch matmuls, now issued for every tile at once:
+  a dedicated fused kernel that keeps the score tile out of HBM is the remaining
+  execution work, and it is what a wall-clock scaling claim should wait for.
+  Raising `scan_chunk` above the default buys nothing, because the tile stopped
+  being a launch-count knob when the tiles stopped being a loop.
 - `naive` and `quad` establish semantics and stay the parity references.
 - Many cross-axis combinations are intentionally rejected. Do not bypass those
   checks through private `_core` fields.

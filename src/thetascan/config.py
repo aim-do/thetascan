@@ -412,12 +412,13 @@ class RuntimeConfig:
     ``chunk`` on every device, and FLA only for the ungated plain-sum scan on
     CUDA when the package is installed.
 
-    ``chunk`` is the default implementation.  It forms the causal score one
-    ``[scan_chunk, scan_chunk]`` tile at a time and carries an explicit
-    ``[Dk, Dv]`` state across tiles, so its activation footprint grows linearly
-    in sequence length instead of quadratically, and it performs about six times
-    fewer multiply-accumulates than the quadratic form at the reference width.
-    It is exact for both temporal modes and needs no compiled extension.
+    ``chunk`` is the default implementation.  It forms the causal score in
+    ``[scan_chunk, scan_chunk]`` tiles -- all of them in one batched call -- and
+    carries an explicit ``[Dk, Dv]`` state across tiles, so its activation
+    footprint grows linearly in sequence length instead of quadratically, and it
+    performs about six times fewer multiply-accumulates than the quadratic form
+    at the reference width.  It is exact for both temporal modes and needs no
+    compiled extension.
 
     The explicit portable backends compute the same scan and exist for
     debugging, profiling and parity: ``naive`` is the sequential reference loop;

@@ -350,10 +350,12 @@ core and returned by `mixer.regularization_loss()`.
 Backend choice is execution, not an algorithm axis. Every backend computes the
 same scan, and each is covered against the sequential `naive` oracle in float64.
 
-`chunk` is the default. It forms the causal score one `[scan_chunk, scan_chunk]`
-tile at a time and carries an explicit `[Dk, Dv]` state across tiles, so its
-activation footprint grows linearly in sequence length where `quad` grows
-quadratically.
+`chunk` is the default. It forms the causal score in
+`[scan_chunk, scan_chunk]` tiles and carries an explicit `[Dk, Dv]` state across
+tiles, so its activation footprint grows linearly in sequence length where
+`quad` grows quadratically. Every tile is issued in one batched call and the
+cross-tile state is a scan over the tile axis, so the number of operations a
+scan costs does not depend on the sequence length or on the tile size.
 
 Peak memory measured on one H100 in bfloat16 against `quad`, same process,
 backend order reversed to cancel drift, at the default `scan_chunk=512`:
@@ -375,10 +377,11 @@ replays the list in reverse so ordering cannot masquerade as an effect; pass
 `scan_chunk` trades the two terms of the footprint, `T * scan_chunk` for the
 score tiles against `(T / scan_chunk) * Dk * Dv` for the carried states, so the
 lightest footprint is near `sqrt(Dk * Dv)` — roughly 128 at the reference
-widths. Going that low is not free: small tiles are launch-bound, compilation
-does not rescue them, and because the tile loop unrolls statically a small tile
-also raises compile time. The default of `512` keeps the footprint reduction
-without paying either cost.
+widths. Raising it above the default buys nothing: the tile is not a
+launch-count knob, because every tile is issued in one batched call, while the
+`T * scan_chunk` score term means a larger tile costs both time and memory. The
+default of `512` sits a little above the footprint optimum; lower it toward
+`sqrt(Dk * Dv)` if memory is the binding constraint.
 
 ### Compilation
 
@@ -386,6 +389,12 @@ without paying either cost.
 configuration field for it, and any backend can be compiled. It is worth
 enabling, and what it delivers depends on the **temporal mode** rather than on
 the backend.
+
+It also depends on what else the host does. Compiling a model whose residual
+blocks are wrapped in `torch.utils.checkpoint` measured as a complete no-op --
+byte-identical kernel profile -- because the checkpoint boundary keeps the
+elementwise work from fusing. The two decisions are the host's and they only pay
+together; a caller who enables one and not the other should not expect either.
 
 `temporal.mode="sum"` traces to a single graph and compiles cleanly. A mode that
 carries a retention -- `"ema"` and `"bank"` -- currently does not. The read hands
@@ -395,12 +404,11 @@ step, and the frame eventually falls back. Results stay correct -- only the
 speed-up is lost. This is a limitation of the current implementation rather than
 of the algorithm, and it is independent of the selected backend.
 
-Two consequences worth knowing before benchmarking. A compiled measurement is
+One consequence worth knowing before benchmarking: a compiled measurement is
 only meaningful with a non-zero blend: at the default zero-initialized
 `blend_mode` weights the recency branches contribute nothing and may be
-optimized away, so the figure does not describe the configured model. And the
-`chunk` tile loop unrolls statically, so a smaller `scan_chunk` raises compile
-time in proportion to the tile count.
+optimized away, so the figure does not describe the configured model. Compile
+time no longer depends on `scan_chunk`, because the tiles are not unrolled.
 
 `quad` is the masked-matmul dual form. It materializes the full `[B, H, T, T]`
 causal score, and a second tensor of that shape when a retention is active. It

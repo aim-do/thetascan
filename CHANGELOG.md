@@ -58,9 +58,9 @@ affected.
   note claiming compilation could not close the tile-loop gap is no longer the
   relevant statement, because there is no tile loop.
 - Added the `chunk` scan backend and the `RuntimeConfig.scan_chunk` tile size.
-  It forms the causal score one `[scan_chunk, scan_chunk]` tile at a time and
-  carries an explicit `[Dk, Dv]` state between tiles, so activations grow
-  linearly rather than quadratically in sequence length. It covers exactly the
+  It forms the causal score in `[scan_chunk, scan_chunk]` tiles and carries an
+  explicit `[Dk, Dv]` state between tiles, so activations grow linearly rather
+  than quadratically in sequence length. It covers exactly the
   two promoted temporal views, the plain causal sum and the static per-head
   recency retention, needs no compiled extension, and runs on CPU and CUDA.
   Peak memory measured against `quad` on one H100 in bfloat16 across all three
