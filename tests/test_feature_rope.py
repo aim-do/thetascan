@@ -336,6 +336,45 @@ class FeatureRoPETests(unittest.TestCase):
         expected = (q0 * relative_k).sum()
         torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
 
+    def test_long_context_rope_forms_positions_in_fp32(self) -> None:
+        """BF16 cache generation must not quantize the integer positions first."""
+        time, width, base = 131_072, 8, 10_000.0
+        cos_bf16, sin_bf16 = rope_cache(
+            time, width, base, "cpu", torch.bfloat16
+        )
+        cos_fp32, sin_fp32 = rope_cache(
+            time, width, base, "cpu", torch.float32
+        )
+
+        self.assertEqual(cos_bf16.dtype, torch.bfloat16)
+        self.assertEqual(sin_bf16.dtype, torch.bfloat16)
+        torch.testing.assert_close(
+            cos_bf16.float(), cos_fp32.to(torch.bfloat16).float(),
+            rtol=0.0, atol=0.0,
+        )
+        torch.testing.assert_close(
+            sin_bf16.float(), sin_fp32.to(torch.bfloat16).float(),
+            rtol=0.0, atol=0.0,
+        )
+
+        # Around 2**16 a BF16 arange aliases many adjacent integers.  A phase
+        # built from FP32 indices still produces distinct adjacent rotations.
+        start = 65_535
+        self.assertFalse(
+            torch.equal(cos_bf16[start], cos_bf16[start + 1])
+            and torch.equal(sin_bf16[start], sin_bf16[start + 1])
+        )
+
+    def test_rope_cache_is_reused_for_identical_qk_and_layer_contracts(self) -> None:
+        first_cos, first_sin = rope_cache(
+            257, 16, 10_000.0, torch.device("cpu"), torch.bfloat16
+        )
+        second_cos, second_sin = rope_cache(
+            257, 16, 10_000, "cpu", torch.bfloat16
+        )
+        self.assertIs(first_cos, second_cos)
+        self.assertIs(first_sin, second_sin)
+
 
 if __name__ == "__main__":
     unittest.main()
