@@ -416,33 +416,42 @@ def dual_read_views(weights, cfg, q, streams, views, hrot=None,
             return terms
 
         keys, vals = streams.la2[l]
-        # hq cast: the mass runs at hq's WIDER dtype -- the denominator is cheap,
-        # so keep it accurate -- while the scan runs at the key stream's dtype.
-        # mass_cum dispatches on the view: sum/EMA key mass normally, stale mass
-        # under a stale bank, zeros for the zero-memory base read.  A two-stage
-        # GN read passes its stage-one mass in, since both stages share it.
-        kcums = [
-            mass if mass is not None else view.mass_cum(keys.to(one.dtype))
-            for view, one, mass in zip(group, queries, masses)
-        ]
-        if cfg.read_norm_mode == "feature_mass":
-            # Each view divides the query by its own mass, so no query is shared.
+        if cfg.read_norm_mode == "key_mass":
+            # The denominator is q . sum_j omega_j k_j, which is this same scan
+            # against a unit payload, so it rides along as one extra value
+            # column instead of a separate running key mass.  That matters a
+            # lot: the [B,H,T,m] mass is a cumulative sum over a non-innermost
+            # axis, which scans the whole sequence over only B*H*m lanes and is
+            # by far the most expensive kernel in a long-context read -- while
+            # computing a prefix the scan already has.  Because the augmented
+            # column travels through the view's own retention terms, every
+            # temporal view keeps exactly the mass it had: sum, EMA, the stale
+            # difference of a bank, and zero for the zero-memory base read.
+            unit = torch.cat([vals, vals.new_ones(*vals.shape[:3], 1)], dim=-1)
+            if shared_query:
+                scanned = interface.scan_views(
+                    group, hq.to(keys.dtype), keys, unit, "m"
+                )
+            else:
+                scanned = [
+                    view(one.to(keys.dtype), keys, unit, "m")
+                    for view, one in zip(group, queries)
+                ]
             mems = [
-                view((one / (kcum + cfg.eps)).to(keys.dtype), keys, vals, "m")
-                for view, one, kcum in zip(group, queries, kcums)
-            ]
-        elif shared_query:
-            scanned = interface.scan_views(
-                group, hq.to(keys.dtype), keys, vals, "m"
-            )
-            mems = [
-                corr / ((hq * kcum).sum(-1, keepdim=True) + cfg.eps)
-                for corr, kcum in zip(scanned, kcums)
+                corr[..., :-1] / (corr[..., -1:] + cfg.eps) for corr in scanned
             ]
         else:
+            # Per-feature normalization divides the query by its own view's mass
+            # before the scan, so the mass cannot be folded into the payload and
+            # no query is shared.  mass_cum dispatches on the view: sum/EMA key
+            # mass normally, stale mass under a stale bank, zeros for the
+            # zero-memory base read.
+            kcums = [
+                mass if mass is not None else view.mass_cum(keys.to(one.dtype))
+                for view, one, mass in zip(group, queries, masses)
+            ]
             mems = [
-                view(one.to(keys.dtype), keys, vals, "m")
-                / ((one * kcum).sum(-1, keepdim=True) + cfg.eps)
+                view((one / (kcum + cfg.eps)).to(keys.dtype), keys, vals, "m")
                 for view, one, kcum in zip(group, queries, kcums)
             ]
         if cfg.value_centers:
@@ -480,16 +489,19 @@ def dual_read_views(weights, cfg, q, streams, views, hrot=None,
             if entry is None:  # guarded by config; keeps private callers explicit
                 raise RuntimeError("read_norm_w1 requires an LA1 GN stream")
             _, gvals = entry
-            masses = [
-                view.mass_cum(feature_keys.to(h0q.dtype)) for view in group
-            ]
+            # Stage one's matched mass is the same unit-payload column as the
+            # LA2 read below, against the same feature keys; stage two forms its
+            # own because the denominator depends on the query, and the two
+            # stages query different features.
+            unit = torch.cat(
+                [gvals, gvals.new_ones(*gvals.shape[:3], 1)], dim=-1
+            )
             corr1s = interface.scan_views(
-                group, h0q.to(feature_keys.dtype), feature_keys, gvals, "m"
+                group, h0q.to(feature_keys.dtype), feature_keys, unit, "m"
             )
             preacts = [
-                a + corr1[..., :m]
-                / ((h0q * mass).sum(-1, keepdim=True) + cfg.eps)
-                for corr1, mass in zip(corr1s, masses)
+                a + corr1[..., :m] / (corr1[..., -1:] + cfg.eps)
+                for corr1 in corr1s
             ]
             bs = [b] * len(group)
         else:

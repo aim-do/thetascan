@@ -82,6 +82,20 @@ def ema_cumsum(x: torch.Tensor, log_alpha: torch.Tensor, chunk: int = 64) -> tor
     return torch.cat(chunks, dim=2)
 
 
+def causal_prefix_sum(x: torch.Tensor) -> torch.Tensor:
+    """Prefix sum along T for a ``[B,H,T,D]`` stream, scanned innermost.
+
+    ``cumsum`` over a non-innermost axis walks the whole sequence over only
+    ``B*H*D`` lanes.  At long context that single kernel dominates a normalized
+    read -- 131,072 dependent steps over 384 lanes is a few percent of one GPU.
+    Moving T to the innermost axis uses the parallel per-row scan instead, at
+    the cost of one copy in and one strided read out.
+    """
+    if x.shape[2] < 2:
+        return x.clone()
+    return x.transpose(-1, -2).contiguous().cumsum(-1).transpose(-1, -2)
+
+
 def _retention_stream(retention, like: torch.Tensor) -> torch.Tensor | None:
     """Widen a compact per-head retention to the stream a scan kernel wants."""
     if retention is None or retention.ndim == 4:
@@ -176,7 +190,7 @@ class Accumulator:
         overrides this method with its own fast/stale masses."""
         decay = self.decay["m"]
         if decay is None:
-            return keys.cumsum(dim=2)
+            return causal_prefix_sum(keys)
         if self.static_log_alpha is not None:
             # Same recurrence, but the payload is the key itself: this is the
             # scan with a unit query/key, which ema_cumsum computes directly.
@@ -233,7 +247,7 @@ class FadeStale:
         return scan_views((self,), q, k, v, key_kind)[0]
 
     def mass_cum(self, keys: torch.Tensor) -> torch.Tensor:
-        return keys.cumsum(dim=2) - ema_cumsum(keys, self.log_alpha, self.chunk)
+        return causal_prefix_sum(keys) - ema_cumsum(keys, self.log_alpha, self.chunk)
 
 
 class FadeFast:
