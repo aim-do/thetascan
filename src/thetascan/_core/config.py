@@ -9,7 +9,7 @@ WRITE_RULES = ("gn", "kernel")
 ROPES = ("none", "full", "partial")
 ROPE_PLACEMENTS = ("input", "feature")
 DECAYS = ("off", "scalar")
-BACKENDS = ("auto", "naive", "quad", "cumsum", "fla")
+BACKENDS = ("auto", "naive", "quad", "chunk", "cumsum", "fla")
 PARAM_DTYPES = ("fp32", "fp16", "bf16", "fp8_e4m3")
 SOFTMAX_GAIN_MODES = ("fixed", "learned_per_head", "learned_per_feature")
 KERNEL_KINDS = ("softmax_partition", "relu2_ridge", "projected_bspline")
@@ -189,7 +189,13 @@ class ThetaScanConfig:
     ortho_inter: float = 0.0             # weight: cross-head theta0 decorrelation
     value_mlp_ortho: float = 0.0         # row-decorrelation for optional value MLP
     eps: float = 1e-6
-    chunk_size: int = 256                # T-chunking for Gram-product memory bound
+    scan_chunk: int = 512                # T-tile of the chunk backend and of the
+                                         # retention-weighted mass. Retained bytes
+                                         # are T*scan_chunk for the score tiles and
+                                         # (T/scan_chunk)*Dk*Dv for the carried
+                                         # states, so the minimum sits near
+                                         # sqrt(Dk*Dv); 128 fits the reference
+                                         # width. Ignored by naive/quad/cumsum/fla.
 
     def __post_init__(self):
         if self.head_dim is None:
@@ -223,6 +229,8 @@ class ThetaScanConfig:
         chk(self.rope_placement, ROPE_PLACEMENTS, "rope_placement")
         chk(self.decay_gate, DECAYS, "decay_gate")
         chk(self.backend, BACKENDS, "backend")
+        if not isinstance(self.scan_chunk, int) or self.scan_chunk < 1:
+            raise ValueError("scan_chunk must be a positive integer")
         chk(self.param_dtype, PARAM_DTYPES, "param_dtype")
         chk(self.softmax_gain_mode, SOFTMAX_GAIN_MODES, "softmax_gain_mode")
         chk(self.kernel_kind, KERNEL_KINDS, "kernel_kind")

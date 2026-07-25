@@ -338,8 +338,16 @@ allocation, optimizer policy, and schedule. See
   do not continue one memory. See [ROADMAP.md](../ROADMAP.md).
 - Kernel memory requires `depth=1`. GN depth above one is accepted but remains
   experimental and is not established by the public result set.
-- Portable reference backends establish semantics; a dedicated fused kernel is
-  still needed for strong wall-clock scaling claims.
+- The default `chunk` backend keeps activations linear in sequence length and
+  uses 1.17x-3.82x less peak memory than the quadratic `quad` form across the
+  reference presets (see [API.md](API.md#runtimeconfig)). No wall-time
+  comparison is published for the backends; compile first, then measure your
+  own configuration with `benchmarks/scan_backends.py`.
+- `chunk` is still a loop of PyTorch matmuls: a dedicated fused kernel is needed
+  before making any wall-clock scaling claim, small tiles remain launch-bound
+  whether compiled or not, and a small tile also raises compile time because
+  the loop unrolls statically.
+- `naive` and `quad` establish semantics and stay the parity references.
 - Many cross-axis combinations are intentionally rejected. Do not bypass those
   checks through private `_core` fields.
 - Published results are single-seed architecture screens, not a completed

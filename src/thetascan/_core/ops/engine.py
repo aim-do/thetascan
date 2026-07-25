@@ -27,7 +27,7 @@ import torch
 import torch.nn.functional as F
 
 from .nonlin import ELEMENTWISE, silu_d, softmax_S_apply, softmax_W2S
-from . import kernel_features
+from . import interface, kernel_features
 from ..modules.norms import rmsnorm
 
 
@@ -342,52 +342,32 @@ def write_streams(weights, cfg, k, v, hrot=None, softmax_gain=None,
 
 # ------------------------------------------------------------------ dual-form read
 
-def dual_read(weights, cfg, q, streams, acc, hrot=None,
-              softmax_gain=None, kernel_controls=None):
-    """f_{theta_t}(q_t) in dual form; acc is an ops.interface.Accumulator.
-    fast_w1=False: la1 entries are None -> skipped.
-    hrot: the LA2 query h~ is rotated for the scan dot only — the base term
-    W2 h~ stays unrotated."""
+def dual_read_views(weights, cfg, q, streams, views, hrot=None,
+                    softmax_gain=None, kernel_controls=None):
+    """f_{theta_t}(q_t) in dual form, for several temporal views at once.
+
+    ``views`` are ops.interface accumulators.  Everything upstream of the first
+    value that actually depends on the temporal view is computed once and shared,
+    and the scans of shared streams go through ``scan_views``, which forms each
+    score tile once for all of them.
+
+    How far the sharing reaches is set by the algebra, not by a list of blessed
+    recipes.  Kernel memory never feeds a scan result back into its own query, so
+    the query features, the slow decode and the LA2 score are all common and only
+    the payload contraction and the mass differ per view.  A Gauss--Newton read
+    corrects its preactivation with a scan result, so its first stage is common
+    and its second stage necessarily has one query per view.  Per-feature
+    normalization divides the query by its own view's mass, so it splits there
+    too.  Once a view's activations diverge, later depth levels run per view.
+
+    Returns one output per view.  ``dual_read`` is the one-view wrapper.
+    """
     s = 1.0 / math.sqrt(cfg.depth)
     L, m = cfg.depth, weights[0][1].shape[-1]
     n_iter = cfg.write_iters
-    x = q
-    for l in range(L):
-        W1, W2, Wg = weights[l]
-        a = _ein_w(W1, x, "hmd,bhtd->bhtm")
-        b = _ein_w(Wg, x, "hmd,bhtd->bhtm") if cfg.nonlin == "swiglu" else None
-        feature_mass = None
-        if cfg.read_norm_w1:
-            # Experimental two-stage GN read.  Address the existing g_i payloads
-            # with the same positive slow-reference ReLU-squared features p_i that
-            # key LA2, instead of applying the literal signed sum(delta W1) to q.
-            # The matched mass makes this a scan-exact normalized kernel read for
-            # sum, EMA and the fast/stale fade views.  After adding c1 below we
-            # evaluate the nonlinearity again; LA2 therefore sees the corrected h.
-            pre0 = rmsnorm(a, cfg.eps)[0] if cfg.act_norm else a
-            if cfg.learn_thresh:
-                pre0 = pre0 - Wg[..., 0].unsqueeze(0).unsqueeze(2).to(pre0.dtype)
-            h0 = ELEMENTWISE["relu2"][0](pre0)
-            h0q = _hrot_stream(h0, hrot) if hrot is not None else h0
-            feature_keys, _ = streams.la2[l]
-            entry = streams.la1[l]
-            if entry is None:  # guarded by config; keeps private callers explicit
-                raise RuntimeError("read_norm_w1 requires an LA1 GN stream")
-            _, gvals = entry
-            feature_mass = acc.mass_cum(feature_keys.to(h0q.dtype))
-            corr1 = acc(h0q.to(feature_keys.dtype), feature_keys, gvals, "m")
-            denom1 = (h0q * feature_mass).sum(-1, keepdim=True)
-            a = a + corr1[..., :m] / (denom1 + cfg.eps)
-        else:
-            for it in range(n_iter):
-                entry = streams.la1[it * L + l]
-                if entry is None:
-                    continue
-                keys, vals = entry
-                corr = acc(x, keys, vals, "d")
-                a = a + corr[..., :m]
-                if b is not None:
-                    b = b + corr[..., m:]
+
+    def features(a, b, Wg):
+        """Preactivation -> positive feature map, plus the query used for scans."""
         if cfg.nonlin == "swiglu":
             pre = rmsnorm(a, cfg.eps)[0] if cfg.act_norm else a
             preb = rmsnorm(b, cfg.eps)[0] if cfg.act_norm else b
@@ -412,43 +392,153 @@ def dual_read(weights, cfg, q, streams, acc, hrot=None,
                 gq = _gain_for(softmax_gain, cfg, pre)
                 h = torch.softmax(pre * gq, -1) if cfg.nonlin == "softmax_hidden" \
                     else ELEMENTWISE[cfg.nonlin][0](pre)
-        u = _ein_w(W2, h, "hdm,bhtm->bhtd")
-        hq = _hrot_stream(h, hrot) if hrot is not None else h
-        if cfg.read_norm:
-            # linear-attention denominator: y_mem = Σw_i λ̂_i / (Σw_i + eps) with
-            # w_i = <h_q, h_i> — softmax's convex-combination semantics, exact via
-            # a causal key-mass scan with the same temporal weighting as LA2.
-            keys, vals = streams.la2[l]
-            # hq cast: fla needs q/k/v dtype parity (softmax hq is fp32 under
-            # autocast, kernel streams are bf16); the mass cumsum runs at hq's
-            # WIDER dtype — the denominator is cheap, keep it accurate.
-            # mass_cum dispatches on the accumulator: sum/EMA key mass normally,
-            # stale mass (cumsum − ema_cumsum) under read_fade, zeros for the
-            # NullAccumulator base read.
-            # both_feature_mass uses the same write features and temporal weights
-            # for both stages, so one accumulated mass lane serves both denominators.
-            kcum = feature_mass if feature_mass is not None \
-                else acc.mass_cum(keys.to(hq.dtype))
-            if cfg.read_norm_mode == "feature_mass":
-                normalized_query = hq / (kcum + cfg.eps)
-                mem = acc(normalized_query.to(keys.dtype), keys, vals, "m")
-                denom = None
-            else:
-                corr = acc(hq.to(keys.dtype), keys, vals, "m")
-                denom = (hq * kcum).sum(-1, keepdim=True)
-                mem = corr / (denom + cfg.eps)
-            if cfg.value_centers:
-                # decode the retrieved value-center mixture through the codebook
-                # (v1: linear decode = convex combination of centers)
-                Cve = Wg if Wg.shape[0] == q.shape[1] else Wg.expand(q.shape[1], -1, -1)
-                mem = torch.einsum("hvd,bhtv->bhtd", Cve.to(mem.dtype), mem)
-            u = u + mem
-        else:
+        return h, (_hrot_stream(h, hrot) if hrot is not None else h)
+
+    def memory(group, l, Wg, hq, masses):
+        """The LA2 term for every view in ``group``; ``hq`` may be shared."""
+        shared_query = not isinstance(hq, list)
+        queries = [hq] * len(group) if shared_query else hq
+
+        if not cfg.read_norm:
+            terms = []
             for it in range(n_iter):
                 keys, vals = streams.la2[it * L + l]
-                u = u + acc(hq, keys, vals, "m")
-        x = x + s * u
-    return x
+                if shared_query:
+                    scanned = interface.scan_views(group, hq, keys, vals, "m")
+                else:
+                    scanned = [
+                        view(one, keys, vals, "m")
+                        for view, one in zip(group, queries)
+                    ]
+                terms = list(scanned) if not terms else [
+                    total + piece for total, piece in zip(terms, scanned)
+                ]
+            return terms
+
+        keys, vals = streams.la2[l]
+        # hq cast: the mass runs at hq's WIDER dtype -- the denominator is cheap,
+        # so keep it accurate -- while the scan runs at the key stream's dtype.
+        # mass_cum dispatches on the view: sum/EMA key mass normally, stale mass
+        # under a stale bank, zeros for the zero-memory base read.  A two-stage
+        # GN read passes its stage-one mass in, since both stages share it.
+        kcums = [
+            mass if mass is not None else view.mass_cum(keys.to(one.dtype))
+            for view, one, mass in zip(group, queries, masses)
+        ]
+        if cfg.read_norm_mode == "feature_mass":
+            # Each view divides the query by its own mass, so no query is shared.
+            mems = [
+                view((one / (kcum + cfg.eps)).to(keys.dtype), keys, vals, "m")
+                for view, one, kcum in zip(group, queries, kcums)
+            ]
+        elif shared_query:
+            scanned = interface.scan_views(
+                group, hq.to(keys.dtype), keys, vals, "m"
+            )
+            mems = [
+                corr / ((hq * kcum).sum(-1, keepdim=True) + cfg.eps)
+                for corr, kcum in zip(scanned, kcums)
+            ]
+        else:
+            mems = [
+                view(one.to(keys.dtype), keys, vals, "m")
+                / ((one * kcum).sum(-1, keepdim=True) + cfg.eps)
+                for view, one, kcum in zip(group, queries, kcums)
+            ]
+        if cfg.value_centers:
+            # decode the retrieved value-center mixture through the codebook
+            # (v1: linear decode = convex combination of centers)
+            Cve = Wg if Wg.shape[0] == q.shape[1] else Wg.expand(q.shape[1], -1, -1)
+            mems = [
+                torch.einsum("hvd,bhtv->bhtd", Cve.to(mem.dtype), mem)
+                for mem in mems
+            ]
+        return mems
+
+    def layer(group, l, x):
+        """One depth level for views that still share the activation ``x``."""
+        W1, W2, Wg = weights[l]
+        a = _ein_w(W1, x, "hmd,bhtd->bhtm")
+        b = _ein_w(Wg, x, "hmd,bhtd->bhtm") if cfg.nonlin == "swiglu" else None
+        masses = [None] * len(group)
+        preacts = bs = None
+
+        if cfg.read_norm_w1:
+            # Two-stage GN read.  Address the existing g_i payloads with the same
+            # positive slow-reference features that key LA2, instead of applying
+            # the literal signed sum(delta W1) to q.  The matched mass makes this
+            # scan-exact for the sum, EMA and bank views.  The nonlinearity is
+            # evaluated again after the correction, so LA2 sees a corrected h --
+            # which is exactly why the second stage cannot share a query.
+            pre0 = rmsnorm(a, cfg.eps)[0] if cfg.act_norm else a
+            if cfg.learn_thresh:
+                pre0 = pre0 - Wg[..., 0].unsqueeze(0).unsqueeze(2).to(pre0.dtype)
+            h0 = ELEMENTWISE["relu2"][0](pre0)
+            h0q = _hrot_stream(h0, hrot) if hrot is not None else h0
+            feature_keys, _ = streams.la2[l]
+            entry = streams.la1[l]
+            if entry is None:  # guarded by config; keeps private callers explicit
+                raise RuntimeError("read_norm_w1 requires an LA1 GN stream")
+            _, gvals = entry
+            masses = [
+                view.mass_cum(feature_keys.to(h0q.dtype)) for view in group
+            ]
+            corr1s = interface.scan_views(
+                group, h0q.to(feature_keys.dtype), feature_keys, gvals, "m"
+            )
+            preacts = [
+                a + corr1[..., :m]
+                / ((h0q * mass).sum(-1, keepdim=True) + cfg.eps)
+                for corr1, mass in zip(corr1s, masses)
+            ]
+            bs = [b] * len(group)
+        else:
+            for it in range(n_iter):
+                entry = streams.la1[it * L + l]
+                if entry is None:
+                    continue
+                keys, vals = entry
+                corrs = interface.scan_views(group, x, keys, vals, "d")
+                if preacts is None:
+                    preacts, bs = [a] * len(group), [b] * len(group)
+                preacts = [
+                    pre + corr[..., :m] for pre, corr in zip(preacts, corrs)
+                ]
+                if b is not None:
+                    bs = [one + corr[..., m:] for one, corr in zip(bs, corrs)]
+
+        if preacts is None:                    # no view-dependent correction yet
+            h, hq = features(a, b, Wg)
+            base = _ein_w(W2, h, "hdm,bhtm->bhtd")
+            return [
+                x + s * (base + mem)
+                for mem in memory(group, l, Wg, hq, masses)
+            ]
+
+        outputs = []
+        for view, pre, one_b, mass in zip(group, preacts, bs, masses):
+            h, hq = features(pre, one_b, Wg)
+            base = _ein_w(W2, h, "hdm,bhtm->bhtd")
+            mem = memory([view], l, Wg, hq, [mass])[0]
+            outputs.append(x + s * (base + mem))
+        return outputs
+
+    xs = [q] * len(views)
+    for l in range(L):
+        if all(one is xs[0] for one in xs):
+            xs = layer(list(views), l, xs[0])
+        else:
+            xs = [layer([view], l, one)[0] for view, one in zip(views, xs)]
+    return tuple(xs)
+
+
+def dual_read(weights, cfg, q, streams, acc, hrot=None,
+              softmax_gain=None, kernel_controls=None):
+    """Single-view :func:`dual_read_views`; ``acc`` is an interface accumulator."""
+    return dual_read_views(
+        weights, cfg, q, streams, (acc,), hrot=hrot,
+        softmax_gain=softmax_gain, kernel_controls=kernel_controls,
+    )[0]
 
 
 # ------------------------------------------------------------------ naive oracle

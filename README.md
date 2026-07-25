@@ -229,7 +229,7 @@ ThetaScanConfig
 |   +-- recency_branches: 1 | 2
 |   +-- retention or half-life initialization and blend mode
 +-- regularization
-+-- runtime: auto | naive | quad | cumsum | fla
++-- runtime: auto | naive | quad | chunk | cumsum | fla, scan_chunk
 ```
 
 The release terminology separates mechanism names from compact configuration
@@ -263,11 +263,15 @@ with open("config.json", encoding="utf-8") as handle:
 `ThetaScan` snapshots a deep copy of the config when constructed. Mutating the
 original dataclass later does not partially reconfigure a live module.
 
-`runtime.backend="auto"` is intentional: it chooses FLA on a supported CUDA
-input when the package is available, but retains a portable PyTorch fallback
-for CPU, CI, and parity tests. The selection follows the current input device,
-including after a module is moved between CPU and CUDA. FLA is an accelerator,
-not the only definition of the algorithm.
+`runtime.backend="auto"` is intentional: it selects the portable `chunk`
+backend, which tiles the causal score and carries an explicit state between
+tiles so that activations grow linearly rather than quadratically in sequence
+length. It is chosen on every device and for every temporal mode, because in
+measurement no capability probe picked a faster option. Optional FLA
+acceleration is available as an explicit choice for one case; see
+[docs/API.md](docs/API.md#runtimeconfig). No backend is the definition of the
+algorithm: `naive` is the sequential oracle and `quad` the reference dual form,
+and both are checked against `chunk` in float64.
 
 `rope=RoPEConfig()` is a shared positional axis for both families. Its default
 is `mode="none"`; the versioned reference presets provide partial-RoPE

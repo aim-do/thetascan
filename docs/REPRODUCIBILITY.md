@@ -25,8 +25,8 @@ expansion (shapes, key determinism, state-dict round trips, dense equivalence
 at factor one, backend parity), value anchors, the value MLP, frozen key/query
 feature parameters, config serialization/snapshot semantics, regularization,
 explicit unsupported-combination errors, the benchmark presets, and agreement
-of the portable `naive`/`quad` backends (`cumsum` participates for the
-undecayed sum path it supports). The listed configuration examples exercise
+of the portable `naive`/`quad`/`chunk` backends at several tile sizes
+(`cumsum` participates for the undecayed sum path it supports). The listed configuration examples exercise
 the versioned publication recipes.
 
 
@@ -39,9 +39,16 @@ with the installed Torch, CUDA, and Triton stack:
 python -m pip install -e '.[fla]'
 ```
 
-Use `RuntimeConfig(backend="auto")` first.  It provides a portable PyTorch
-fallback; forcing `backend="fla"` is appropriate only after a local forward and
-backward smoke test on the target GPU.
+Use `RuntimeConfig(backend="auto")` first.  It selects the portable `chunk`
+backend on every device and for every temporal mode.  Forcing `backend="fla"` is
+appropriate only after a local forward *and* backward smoke test on the target
+GPU: FLA raises from its gated backward on Hopper with Triton `>= 3.4`, so a
+retained view fails only once a step is propagated.
+
+The published v0.1.0 measurements ran without `flash-linear-attention`, where
+`auto` resolved to `quad`.  To reproduce one of those numbers bit for bit, pass
+`backend="quad"` explicitly; `chunk` sums tile-local retention exponents, which
+is exact in float64 but a different rounding order in reduced precision.
 
 ## Full language-model benchmark
 

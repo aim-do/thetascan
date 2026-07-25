@@ -235,7 +235,7 @@ axis fixed.
 
 | Field | Default | Accepted values | Meaning |
 |---|---:|---|---|
-| `mode` | `"sum"` | `"sum"`, `"ema"`, `"bank"` | Plain prefix sum, learned write-side EMA, or a temporal-mode bank: the sum plus recency reads. |
+| `mode` | `"sum"` | `"sum"`, `"ema"`, `"bank"` | One unweighted prefix sum; one exponentially decaying state with a learned per-head data-dependent retention, and no sum alongside it; or a temporal-mode bank, the sum plus one or two recency reads blended into it. |
 | `bank_mode` | `"fast"` | `"fast"`, `"stale"` | `fast` blends toward each EMA read; `stale` is the complementary historical view. |
 | `retention_init` | `0.9` | Float in `(0,1)` | Initial retention for a one-branch temporal-mode bank. |
 | `recency_branches` | `1` | `1`, `2` | Number of recency branches. Two branches plus the sum give three temporal views. |
@@ -246,6 +246,16 @@ axis fixed.
 For two branches with no explicit tuple, retentions resolve to `(0.9, 0.99)`.
 Distinct timescales are required. In normalized memory, every view filters its
 numerator and denominator with the same weights and divides before blending.
+
+**Choosing a mode.** The modes differ in how many times the same write streams
+are read, which is the dominant cost of the mixer. `sum` and `ema` are one read
+each. A bank is the sum plus one read per recency branch, so the two-branch
+reference recipe is three reads. `ema` therefore buys forgetting at one read
+where a bank buys a learned mixture of timescales at three; if one timescale is
+enough for the task, `ema` is the cheaper way to get it. `sum` additionally
+compiles more cleanly than either retained mode -- see
+[Compilation](#compilation) -- and is the only mode the optional `fla` backend
+supports.
 
 Example two-recency-branch temporal-mode bank:
 
@@ -334,15 +344,104 @@ core and returned by `mixer.regularization_loss()`.
 
 | Field | Default | Accepted values | Meaning |
 |---|---:|---|---|
-| `backend` | `"auto"` | `"auto"`, `"naive"`, `"quad"`, `"cumsum"`, `"fla"` | `auto` chooses supported FLA acceleration on CUDA and otherwise a portable PyTorch path. The explicit backends are useful for parity tests and profiling. |
+| `backend` | `"auto"` | `"auto"`, `"naive"`, `"quad"`, `"chunk"`, `"cumsum"`, `"fla"` | `auto` always selects `chunk`. The explicit backends are useful for parity tests, profiling, and the one case where `fla` wins. |
+| `scan_chunk` | `512` | integer `>= 1` | Time tile of the `chunk` backend. Other backends ignore it. |
 
-Backend choice is execution, not an algorithm axis. Test forward and backward
-on the target Torch/CUDA/FLA stack before forcing `fla`.
+Backend choice is execution, not an algorithm axis. Every backend computes the
+same scan, and each is covered against the sequential `naive` oracle in float64.
+
+`chunk` is the default. It forms the causal score one `[scan_chunk, scan_chunk]`
+tile at a time and carries an explicit `[Dk, Dv]` state across tiles, so its
+activation footprint grows linearly in sequence length where `quad` grows
+quadratically.
+
+Peak memory measured on one H100 in bfloat16 against `quad`, same process,
+backend order reversed to cancel drift, at the default `scan_chunk=512`:
+
+| Preset | T=1024 | T=2048 | T=4096 |
+|---|---|---|---|
+| `gn_reference_v0_1` | 1.42x lighter | 2.20x | 3.82x |
+| `gn_expanded_reference_v0_1` | 1.17x | 1.62x | 2.51x |
+| `kernel_expanded_reference_v0_1` | 1.50x | 2.02x | 2.80x |
+
+No wall-time comparison is published for any backend. Which one is faster
+depends on sequence length, on whether the model is compiled, and on the
+device, and the differences are small enough at the reference length that a
+single number would mislead. Measure your own configuration with
+`benchmarks/scan_backends.py`, which runs the backends in one process and
+replays the list in reverse so ordering cannot masquerade as an effect; pass
+`--compile` to match a compiled training loop.
+
+`scan_chunk` trades the two terms of the footprint, `T * scan_chunk` for the
+score tiles against `(T / scan_chunk) * Dk * Dv` for the carried states, so the
+lightest footprint is near `sqrt(Dk * Dv)` — roughly 128 at the reference
+widths. Going that low is not free: small tiles are launch-bound, compilation
+does not rescue them, and because the tile loop unrolls statically a small tile
+also raises compile time. The default of `512` keeps the footprint reduction
+without paying either cost.
+
+### Compilation
+
+`torch.compile` is applied by the host, not by this library: there is no
+configuration field for it, and any backend can be compiled. It is worth
+enabling, and what it delivers depends on the **temporal mode** rather than on
+the backend.
+
+`temporal.mode="sum"` traces to a single graph and compiles cleanly. A mode that
+carries a retention -- `"ema"` and `"bank"` -- currently does not. The read hands
+the engine an accumulator object that owns a freshly allocated decay stream;
+TorchDynamo guards that tensor by identity, the guard is invalidated on every
+step, and the frame eventually falls back. Results stay correct -- only the
+speed-up is lost. This is a limitation of the current implementation rather than
+of the algorithm, and it is independent of the selected backend.
+
+Two consequences worth knowing before benchmarking. A compiled measurement is
+only meaningful with a non-zero blend: at the default zero-initialized
+`blend_mode` weights the recency branches contribute nothing and may be
+optimized away, so the figure does not describe the configured model. And the
+`chunk` tile loop unrolls statically, so a smaller `scan_chunk` raises compile
+time in proportion to the tile count.
+
+`quad` is the masked-matmul dual form. It materializes the full `[B, H, T, T]`
+causal score, and a second tensor of that shape when a retention is active. It
+remains the reference implementation and the backend the published v0.1.0
+measurements used; `chunk` with `scan_chunk >= T` reproduces it bit for bit.
 
 `cumsum` supports `temporal.mode="sum"` only and validation rejects it with
 `ema` or `bank`: its decayed form divides by a clamped cumulative product and
 silently loses precision once a long sequence's accumulated decay leaves the
 guard range. `auto` never selects `cumsum`.
+
+`fla` needs the optional `flash-linear-attention` dependency and CUDA tensors,
+applies to `temporal.mode="sum"` only, and is never selected by `auto`. Two
+measured reasons.
+
+Its kernel wrapper is closed to the compiler, so a compiled model breaks into
+several graphs around each call. It does still gain from compilation -- the work
+around the scan is fused -- but it gains the least of the three backends, because
+the scan itself cannot be, and measured on one H100 it ends up the slowest of the
+three once compiled, at every length tried.
+
+Without a retention and **without compilation** it is the fastest option at long
+context, at some cost in peak memory. That is the one case worth selecting it for
+by hand, and it is narrow: a compiled portable tile measured comfortably faster
+than an uncompiled FLA at the same length, so compiling is the better move
+whenever it is available.
+
+It also cannot run a retention at all on the stack tested. On Hopper with
+Triton `>= 3.4`, FLA refuses its own gated backward, so `temporal.mode="ema"`
+and `"bank"` fail outright:
+
+```
+RuntimeError: Triton >= 3.4.0 on Hopper GPUs produces incorrect results for
+gated chunk_bwd_dqkwg (see #640). Please install tilelang
+```
+
+That failure is raised from backward, so it appears only once a step is
+propagated, and installing `tilelang` as the message suggests does not help.
+Selecting `fla` explicitly for a retained view is therefore expected to fail on
+such a stack. Test a forward *and* a backward on the target
+Torch/CUDA/Triton/FLA combination before forcing `fla`.
 
 ## Configuration serialization
 
@@ -418,7 +517,7 @@ required typed persistent-state contract and parity tests are specified in
 
 ## Support summary
 
-| Configuration | Sum | Write-side EMA | One/two recency branches | Random feature expansion |
+| Configuration | `sum` | `ema` | `bank`, one/two branches | Random feature expansion |
 |---|---:|---:|---:|---|
 | GN, unnormalized | yes | yes | yes | `relu2`/`relu2_threshold` only |
 | GN ReLU-squared, W2 feature mass | yes | yes | yes | yes (one Jacobian step) |

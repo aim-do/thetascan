@@ -26,6 +26,8 @@ not name a separate algorithm or software package.
 | **free blend** | Unconstrained signed temporal blend coefficient. | `blend_mode="free"` |
 | **tanh-bounded blend** | Signed blend mapped through `tanh`, hence in `(-1,1)`. | `blend_mode="tanh"` |
 | **per-head biases** | Zero-initialized head-specific offsets added after shared K/Q projections. | Use “biases,” not “offsets,” in public descriptions. |
+| **tiled scan** | Execution strategy, not a mechanism: the causal score is formed one square time tile at a time and an explicit carried state links consecutive tiles, so activations grow linearly rather than quadratically in sequence length. Every backend computes the same memory. | `runtime.backend="chunk"` |
+| **scan tile** | The time extent of one such tile. Call it a tile, not a block or a window: “block” already names a memory depth level and “window” a temporal restriction. | `runtime.scan_chunk` |
 
 Result summaries and public manifests use these terms consistently. Internal
 research provenance is represented by source hashes rather than by exposing

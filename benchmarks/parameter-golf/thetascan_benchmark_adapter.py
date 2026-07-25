@@ -28,7 +28,7 @@ RECIPES: Final = {
     ),
 }
 ROPE_MODES: Final = ("none", "partial", "full")
-BACKENDS: Final = ("auto", "naive", "quad", "cumsum", "fla")
+BACKENDS: Final = ("auto", "naive", "quad", "chunk", "cumsum", "fla")
 PROJECTION_LAYOUTS: Final = ("mamba-shared", "transformer-gqa", "independent")
 
 

@@ -328,8 +328,9 @@ class ThetaScan(nn.Module):
         else:
             self.fade_alpha = None
             self.fade_eta = None
+        # Set on every forward; kept as an attribute only so tests and probes can
+        # read which implementation the last call resolved to.
         self._backend = None
-        self._backend_device_type = None
 
     def _load_from_state_dict(
         self,
@@ -618,17 +619,20 @@ class ThetaScan(nn.Module):
         decay_d = decay_m = None
         if self.decay is not None:
             decay_d, decay_m = self.decay(x)
-        if self._backend is None or self._backend_device_type != x.device.type:
-            self._backend = resolve_backend(
-                cfg.backend,
-                cfg.decay_gate,
-                cfg.accumulation,
-                device=x.device,
-                require_scalar_decay=cfg.read_fade,
-            )
-            self._backend_device_type = x.device.type
+        # Resolved every call rather than cached on the module.  A cached
+        # attribute makes the first traced call guard on `self._backend is None`
+        # and the second invalidate it, which costs a recompile of this forward
+        # under torch.compile for every temporal mode.  Resolution is pure Python
+        # over config fields and the input device, so a compiler folds it away.
+        self._backend = resolve_backend(
+            cfg.backend,
+            cfg.decay_gate,
+            cfg.accumulation,
+            device=x.device,
+            require_scalar_decay=cfg.read_fade,
+        )
         acc = Accumulator(self._backend, decay_d=decay_d, decay_m=decay_m,
-                          eps=cfg.eps)
+                          eps=cfg.eps, chunk=cfg.scan_chunk)
         weights = self._weights()
         kernel_sharpness = self.kernel_sharpness()
         kernel_controls = self.kernel_controls()
@@ -656,6 +660,8 @@ class ThetaScan(nn.Module):
                     decay_d=la_s,
                     decay_m=la_s,
                     eps=cfg.eps,
+                    chunk=cfg.scan_chunk,
+                    static_log_alpha=log_alpha,
                 ))
 
         def read_with_temporal(read_weights, query, read_streams, *,
@@ -676,7 +682,7 @@ class ThetaScan(nn.Module):
                     fade_fasts, fade_log_alphas, fade_etas
                 ):
                     facc = FadeFast(
-                        fast_acc, log_alpha, chunk=min(cfg.chunk_size, 64)
+                        fast_acc, log_alpha, chunk=cfg.scan_chunk
                     )
                     out_fast = engine.dual_read(
                         read_weights, cfg, query, read_streams, facc,
@@ -702,7 +708,7 @@ class ThetaScan(nn.Module):
             ):
                 out_stale = engine.dual_read(
                     read_weights, cfg, query, read_streams,
-                    FadeStale(acc, fast_acc, log_alpha),
+                    FadeStale(acc, fast_acc, log_alpha, cfg.scan_chunk),
                     hrot=hrot,
                     softmax_gain=kernel_sharpness,
                     kernel_controls=controls,

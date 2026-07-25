@@ -353,7 +353,7 @@ The purpose of the benchmark is a falsifiable minimum: if replacing attention la
 
 ### 9.1 Protocol
 
-The host is a 9-layer GPT-style decoder from the open Parameter Golf project [35]: width 512, context 1,024, vocabulary 1,024, eight query heads with grouped four-head key/value attention [36]. Two middle mixers (layers 4 and 5) are replaced; everything else is fixed. Each step processes 524,288 FineWeb tokens in bfloat16 on one H100. The **whole-model trainable parameter count** is matched across arms by trimming only the two adjacent FFNs; parameter matching is the control, while state bytes, compute, and wall time differ and are reported. ThetaScan arms use one shared key and query projection with per-head biases [37], partial input-space RoPE, and the `quad` portable evaluator.
+The host is a 9-layer GPT-style decoder from the open Parameter Golf project [35]: width 512, context 1,024, vocabulary 1,024, eight query heads with grouped four-head key/value attention [36]. Two middle mixers (layers 4 and 5) are replaced; everything else is fixed. Each step processes 524,288 FineWeb tokens in bfloat16 on one H100. The **whole-model trainable parameter count** is matched across arms by trimming only the two adjacent FFNs; parameter matching is the control, while state bytes and compute differ. ThetaScan arms use one shared key and query projection with per-head biases [37], partial input-space RoPE, and the `quad` portable evaluator.
 
 **Optimizer policy is part of each arm.** The attention and Mamba-3 baselines train under the host benchmark's `muon-2d` policy — Muon [38] for two-dimensional matrices, Adam elsewhere. Every ThetaScan arm trains under `muon-2d+theta`, which additionally routes the memory factors $W_1,W_2$ through batched per-head Muon. The table below therefore compares architecture-plus-policy pairs, not a pure mixer swap under one optimizer; the baselines were not re-tuned with per-head Muon, and a policy-crossed comparison is future work.
 
@@ -361,25 +361,25 @@ The schedule declares 7,500 steps with warmdown over the final 750. The league r
 
 ### 9.2 The five-arm league at step 7,500
 
-| arm | trainable parameters | raw bpb @7,500 | exact int8 bpb @7,500 | step time |
-|---|---:|---:|---:|---:|
-| **GN, 2x random expansion** (`gn-expanded-reference-v0.1`) | 17,059,928 | **1.2327** | **1.23830852** | 1,311.40 ms |
-| GN reference, dense (`gn-reference-v0.1`) | 17,059,928 | 1.2342 | 1.23984702 | 970.86 ms |
-| attention (host control) | 17,059,912 | 1.2349 | 1.24071718 | 501.17 ms |
-| kernel ReLU-squared ridge, 2x random expansion (`kernel-expanded-reference-v0.1`) | 17,059,976 | 1.2361 | 1.24215211 | 983.37 ms |
-| Mamba-3 parity control (official module) | 17,059,160 | 1.3194 | 1.32677632 | 544.20 ms |
+| arm | trainable parameters | raw bpb @7,500 | exact int8 bpb @7,500 |
+|---|---:|---:|---:|
+| **GN, 2x random expansion** (`gn-expanded-reference-v0.1`) | 17,059,928 | **1.2327** | **1.23830852** |
+| GN reference, dense (`gn-reference-v0.1`) | 17,059,928 | 1.2342 | 1.23984702 |
+| attention (host control) | 17,059,912 | 1.2349 | 1.24071718 |
+| kernel ReLU-squared ridge, 2x random expansion (`kernel-expanded-reference-v0.1`) | 17,059,976 | 1.2361 | 1.24215211 |
+| Mamba-3 parity control (official module) | 17,059,160 | 1.3194 | 1.32677632 |
 
 The replacement goal is met: both GN arms finished below the attention control on both metrics, the expanded kernel arm finished close behind it, and every ThetaScan arm finished far ahead of the Mamba-3 control. The expanded GN arm — the same trainable memory budget as the dense arm at doubled effective width — also improved on its dense counterpart, the capacity effect predicted in Section 6. Limitations are collected in Section 9.4.
 
 ### 9.3 What the measurements suggest
 
-Three suggestions, each with its qualification. First, nonlinear fast memory with normalized two-stage reads is **competitive with attention in the hybrid regime** at matched trainable parameters. Second, **random feature expansion helps at fixed trainable budget**: the expanded GN arm beat the dense arm with the same trainable memory, paying in state and step time; this is the cleanest single-axis observation in the league because the two arms differ only in expansion and its width bookkeeping. Third, the kernel family remains close but behind GN at this scale; whether that is the write rule or the feature map is unresolved — the expanded kernel arm changed both relative to the expanded GN arm. Finally, the GN nonlinearity menu beyond squared ReLU — SiLU and SwiGLU are implemented and exposed — has not been screened at this scale and is an obvious next comparison.
+Three suggestions, each with its qualification. First, nonlinear fast memory with normalized two-stage reads is **competitive with attention in the hybrid regime** at matched trainable parameters. Second, **random feature expansion helps at fixed trainable budget**: the expanded GN arm beat the dense arm with the same trainable memory, paying in state; this is the cleanest single-axis observation in the league because the two arms differ only in expansion and its width bookkeeping. Third, the kernel family remains close but behind GN at this scale; whether that is the write rule or the feature map is unresolved — the expanded kernel arm changed both relative to the expanded GN arm. Finally, the GN nonlinearity menu beyond squared ReLU — SiLU and SwiGLU are implemented and exposed — has not been screened at this scale and is an obvious next comparison.
 
 Detailed trajectories, per-arm configuration manifests, parameter contracts, and provenance are in the [experiment evidence map](../benchmarks/parameter-golf/results/EXPERIMENT_EVIDENCE.md) and the [7,500-step record](../benchmarks/parameter-golf/results/2026-07-21-h100-continuation-7500-v1/SUMMARY.md).
 
 ### 9.4 Limitations
 
-Single seed; one host model and scale; two swapped layers, so this is evidence for the hybrid regime, not for a pure ThetaScan stack; optimizer policy differs by design between baselines and ThetaScan arms; and the evaluator is a portable materialized path at context 1,024, so step times compare reference implementations rather than fused kernels. Long-context recall under controlled load, replication seeds, and a fused scan kernel are the missing pieces for stronger claims.
+Single seed; one host model and scale; two swapped layers, so this is evidence for the hybrid regime, not for a pure ThetaScan stack; optimizer policy differs by design between baselines and ThetaScan arms; and the evaluator is a portable materialized path at context 1,024. **No wall-time comparison is reported.** The arms were not run under a matched execution and compilation policy, and the mixer evaluator has since changed, so any step time here would compare implementations and compiler behaviour rather than architectures; a speed claim needs all arms re-measured together under one policy. Long-context recall under controlled load, replication seeds, and a fused scan kernel are the missing pieces for stronger claims.
 
 ---
 

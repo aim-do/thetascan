@@ -34,13 +34,18 @@ the learning-rate warmdown completed before step 7,500. Lower bits per byte
 
 ## Step-7,500 endpoint (terminally cooled)
 
-| Arm | Public recipe | Raw BPB | Exact-int8 BPB | Delta vs Attention (int8) | Parameters | Artifact bytes | Step ms |
-|---|---|---:|---:|---:|---:|---:|---:|
-| GN expanded reference (2x random feature expansion) | `gn-expanded-reference-v0.1` | **1.2327** | **1.23830852** | -0.00240866 | 17,059,928 | 16,036,604 * | 1,311.40 |
-| GN reference | `gn-reference-v0.1` | 1.2342 | 1.23984702 | -0.00087016 | 17,059,928 | 15,953,281 | 970.86 |
-| Attention | (host baseline) | 1.2349 | 1.24071718 | 0.00000000 | 17,059,912 | 15,890,122 | 501.17 |
-| Kernel expanded reference (2x random feature expansion) | `kernel-expanded-reference-v0.1` | 1.2361 | 1.24215211 | +0.00143493 | 17,059,976 | 16,012,318 * | 983.37 |
-| Mamba-3 parity | (official module) | 1.3194 | 1.32677632 | +0.08605914 | 17,059,160 | 15,883,475 | 544.20 |
+| Arm | Public recipe | Raw BPB | Exact-int8 BPB | Delta vs Attention (int8) | Parameters | Artifact bytes |
+|---|---|---:|---:|---:|---:|---:|
+| GN expanded reference (2x random feature expansion) | `gn-expanded-reference-v0.1` | **1.2327** | **1.23830852** | -0.00240866 | 17,059,928 | 16,036,604 * |
+| GN reference | `gn-reference-v0.1` | 1.2342 | 1.23984702 | -0.00087016 | 17,059,928 | 15,953,281 |
+| Attention | (host baseline) | 1.2349 | 1.24071718 | 0.00000000 | 17,059,912 | 15,890,122 |
+| Kernel expanded reference (2x random feature expansion) | `kernel-expanded-reference-v0.1` | 1.2361 | 1.24215211 | +0.00143493 | 17,059,976 | 16,012,318 * |
+| Mamba-3 parity | (official module) | 1.3194 | 1.32677632 | +0.08605914 | 17,059,160 | 15,883,475 |
+
+Step times are deliberately absent: the arms were not run under a matched
+execution and compilation policy, so a per-step figure would compare
+implementations rather than architectures. The raw values remain in the
+per-arm training logs collected with this run.
 
 \* Research-only artifacts: the two expanded arms exceed the 16,000,000-byte
 submission cap by 36,604 and 12,318 bytes respectively. They are valid

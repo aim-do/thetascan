@@ -30,7 +30,7 @@ KernelBSplineScaleMode = Literal["fixed", "learned_per_head"]
 TemporalMode = Literal["sum", "ema", "bank"]
 BankMode = Literal["fast", "stale"]
 BlendMode = Literal["free", "tanh"]
-Backend = Literal["auto", "naive", "quad", "cumsum", "fla"]
+Backend = Literal["auto", "naive", "quad", "chunk", "cumsum", "fla"]
 RoPEMode = Literal["none", "partial", "full"]
 RoPEPlacement = Literal["input", "feature"]
 
@@ -408,27 +408,56 @@ class RegularizationConfig:
 
 @dataclass
 class RuntimeConfig:
-    """Execution selection.  ``auto`` uses FLA when available and a portable
-    PyTorch implementation otherwise; it is the recommended setting.
+    """Execution selection.  ``auto`` is the recommended setting: it picks
+    ``chunk`` on every device, and FLA only for the ungated plain-sum scan on
+    CUDA when the package is installed.
+
+    ``chunk`` is the default implementation.  It forms the causal score one
+    ``[scan_chunk, scan_chunk]`` tile at a time and carries an explicit
+    ``[Dk, Dv]`` state across tiles, so its activation footprint grows linearly
+    in sequence length instead of quadratically, and it performs about six times
+    fewer multiply-accumulates than the quadratic form at the reference width.
+    It is exact for both temporal modes and needs no compiled extension.
 
     The explicit portable backends compute the same scan and exist for
-    debugging and profiling: ``naive`` is the sequential reference loop;
+    debugging, profiling and parity: ``naive`` is the sequential reference loop;
     ``quad`` is the masked-matmul dual form, which materializes the full
-    causal score matrix (O(T^2) memory) and trades that for matmul-shaped
-    throughput; ``cumsum`` is the prefix-scan form.
+    causal score matrix (O(T^2) memory) and trades that for one large matmul --
+    it is the reference the published v0.1.0 measurements used, and ``chunk``
+    with ``scan_chunk >= T`` reproduces it bit for bit; ``cumsum`` is the
+    prefix-scan form.
     ``cumsum`` supports ``temporal.mode='sum'`` only: its decay handling
     divides by a clamped cumulative product, which silently loses precision
     once the accumulated decay of a long sequence exceeds the guard range.
     ``auto`` never selects it.
+
+    ``fla`` requires the optional ``flash-linear-attention`` dependency, CUDA
+    tensors, and a Triton build whose gated backward is trustworthy on the
+    target architecture.  Validate a forward and a backward against ``naive``
+    on the target stack before selecting it explicitly; ``auto`` deliberately
+    keeps retained views away from that kernel.
+
+    ``scan_chunk`` tunes the ``chunk`` tile.  Retained bytes are
+    ``T * scan_chunk`` for the score tiles and ``(T / scan_chunk) * Dk * Dv``
+    for the carried states, so the footprint minimum is near
+    ``sqrt(Dk * Dv)``; the default suits the reference memory width.  Other
+    backends ignore it.
     """
 
     backend: Backend = "auto"
+    scan_chunk: int = 512
 
     def validate(self) -> None:
-        if self.backend not in ("auto", "naive", "quad", "cumsum", "fla"):
+        if self.backend not in ("auto", "naive", "quad", "chunk", "cumsum", "fla"):
             raise ValueError(
-                "RuntimeConfig.backend must be one of 'auto', 'naive', 'quad', 'cumsum', 'fla'"
+                "RuntimeConfig.backend must be one of 'auto', 'naive', 'quad', "
+                "'chunk', 'cumsum', 'fla'"
             )
+        if not isinstance(self.scan_chunk, bool) and isinstance(self.scan_chunk, int):
+            if self.scan_chunk < 1:
+                raise ValueError("RuntimeConfig.scan_chunk must be >= 1")
+        else:
+            raise TypeError("RuntimeConfig.scan_chunk must be an int")
 
 
 @dataclass
@@ -677,6 +706,7 @@ class ThetaScanConfig:
             "expansion_key": self.expansion_key,
             "depth": self.depth,
             "backend": self.runtime.backend,
+            "scan_chunk": self.runtime.scan_chunk,
             "rope": self.rope.mode,
             "rope_frac": self.rope.fraction,
             "rope_base": self.rope.base,

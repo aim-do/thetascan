@@ -18,7 +18,7 @@ RECIPES = (
     "kernel-expanded-reference-v0.1",
 )
 ROPE_MODES = ("none", "partial", "full")
-BACKENDS = ("auto", "naive", "quad", "cumsum", "fla")
+BACKENDS = ("auto", "naive", "quad", "chunk", "cumsum", "fla")
 OPTIMIZER_POLICIES = ("muon-2d", "muon-2d+theta")
 PROJECTION_LAYOUTS = ("mamba-shared", "transformer-gqa", "independent")
 

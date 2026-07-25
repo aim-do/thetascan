@@ -9,6 +9,9 @@ build/
 dist/
 tmp/
 
+# Private notes that must never be published
+ROADMAP.private.md
+
 # Local environments and editor/agent state
 .venv/
 venv/

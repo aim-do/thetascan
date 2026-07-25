@@ -149,6 +149,49 @@ class ReleaseHygieneTests(unittest.TestCase):
             [],
         )
 
+    def _public_config_module(self):
+        try:
+            from thetascan import config
+        except ImportError as exc:                 # pragma: no cover
+            self.skipTest(f"thetascan is not importable: {exc}")
+        return config
+
+    def test_every_public_config_field_is_documented(self) -> None:
+        """A field a user can set must be findable in the API reference."""
+        import dataclasses
+
+        config = self._public_config_module()
+        reference = (ROOT / "docs" / "API.md").read_text(encoding="utf-8")
+        undocumented = [
+            f"{cls.__name__}.{field.name}"
+            for cls in (
+                config.ThetaScanConfig,
+                config.GNConfig,
+                config.KernelConfig,
+                config.RoPEConfig,
+                config.TemporalConfig,
+                config.RegularizationConfig,
+                config.RuntimeConfig,
+            )
+            for field in dataclasses.fields(cls)
+            if f"`{field.name}`" not in reference
+        ]
+        self.assertEqual(undocumented, [])
+
+    def test_every_accepted_backend_is_documented(self) -> None:
+        """Backend names are user-facing execution flags, not internal labels."""
+        from typing import get_args
+
+        config = self._public_config_module()
+        reference = (ROOT / "docs" / "API.md").read_text(encoding="utf-8")
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        backends = get_args(config.Backend)
+        self.assertIn("chunk", backends)
+        self.assertEqual(
+            [name for name in backends if f"`{name}`" not in reference], []
+        )
+        self.assertEqual([name for name in backends if name not in readme], [])
+
 
 if __name__ == "__main__":
     unittest.main()

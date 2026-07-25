@@ -10,31 +10,53 @@ from thetascan._core.ops.interface import resolve_backend
 
 
 class BackendResolutionTests(unittest.TestCase):
-    def test_auto_uses_the_actual_input_device(self) -> None:
-        with (
-            mock.patch.object(torch.cuda, "is_available", return_value=True),
-            mock.patch.object(scan_fla, "supports", return_value=True),
-        ):
-            self.assertEqual(resolve_backend("auto", device="cpu"), "quad")
-            self.assertEqual(resolve_backend("auto", device="cuda"), "fla")
+    def test_auto_always_selects_the_portable_chunk_backend(self) -> None:
+        """The default is a measured choice, not a capability probe.
 
-    def test_auto_falls_back_when_required_fla_kernel_is_missing(self) -> None:
+        It must not depend on the device, on whether CUDA is present, or on
+        whether an optional package happens to be importable, because none of
+        those made the faster choice in measurement.
+        """
+        for available in (False, True):
+            with mock.patch.object(
+                torch.cuda, "is_available", return_value=available
+            ):
+                self.assertEqual(resolve_backend("auto"), "chunk")
+                self.assertEqual(resolve_backend("auto", device="cpu"), "chunk")
+                self.assertEqual(resolve_backend("auto", device="cuda"), "chunk")
+
+    def test_auto_never_selects_fla_for_any_temporal_mode(self) -> None:
+        """FLA refuses its gated backward for a retention, and loses compiled.
+
+        Its chunked gated backward is refused for any retention on Hopper with
+        Triton >= 3.4, so every reference preset would fail on its first
+        backward. For the ungated plain sum it does support, a compiled model
+        breaks into several graphs around its compiler-disabled wrapper and
+        measured slower than the portable tile.
+        """
         with (
             mock.patch.object(torch.cuda, "is_available", return_value=True),
-            mock.patch.object(scan_fla, "supports", return_value=False) as supports,
+            mock.patch.object(scan_fla, "supports", return_value=True) as supports,
         ):
-            self.assertEqual(resolve_backend("auto", device="cuda"), "quad")
-            self.assertEqual(
-                resolve_backend(
-                    "auto",
-                    device="cuda",
-                    require_scalar_decay=True,
-                ),
-                "quad",
-            )
-        supports.assert_called_with("off", require_scalar_decay=True)
+            for kwargs in (
+                {},
+                {"require_scalar_decay": True},
+                {"decay_gate": "scalar"},
+                {"accumulation": "ema_gate"},
+            ):
+                with self.subTest(**kwargs):
+                    self.assertEqual(
+                        resolve_backend("auto", device="cuda", **kwargs), "chunk"
+                    )
+        supports.assert_not_called()
+
+    def test_explicit_backends_are_never_overridden(self) -> None:
+        for name in ("naive", "quad", "chunk", "cumsum", "fla"):
+            with self.subTest(name=name):
+                self.assertEqual(resolve_backend(name, device="cpu"), name)
 
     def test_fla_capability_check_matches_required_kernel_kind(self) -> None:
+        """Still used by callers deciding whether an explicit `fla` can run."""
         fake_kernels = {"linear": object(), "simple_gla": None, "gla": None}
         with mock.patch.object(scan_fla, "_load", return_value=fake_kernels):
             self.assertTrue(scan_fla.supports())
