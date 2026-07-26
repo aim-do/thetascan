@@ -5,9 +5,10 @@ tracked separately in the paper itself.
 
 ## Unreleased
 
-Execution-only work. No algorithm, parameterization, preset, or checkpoint
-contract changed, and no result in `benchmarks/parameter-golf/results/` is
-affected.
+Execution and numerical-correctness work. No algorithm, parameterization,
+preset, or checkpoint contract changed. Published v0.1.0 results are unaffected
+because they used `quad`; reduced-precision `chunk` results can move where the
+fixes below remove phase aliasing or a round-off causal leak.
 
 - **Fixed long-context rotary positions.** The RoPE table formed its position
   indices in the activation dtype. A bfloat16 `arange` stops resolving adjacent
@@ -28,10 +29,11 @@ affected.
   per-head retention is the same sum against a fixed geometric weight over that
   axis. A per-token retention stream keeps its sequential state, because the
   parallel alternative materializes the reciprocal decay this backend refuses
-  to form. Semantics are unchanged -- bitwise identical for the sum and
-  per-token views, `1.5e-16` for a static retention, worst gradient `3.6e-16`,
-  and `scan_chunk >= T` still reproduces `quad` bit for bit. Two consequences:
-  the largest retained tensor is now the whole tiled score rather than one tile
+  to form. The mathematical scan is unchanged and float64 remains exact against
+  the oracle. Reduced-precision results can round differently with tile size,
+  and retained results intentionally differ from legacy `quad` once its
+  low-precision position coordinates alias. The largest retained tensor is now
+  the whole tiled score rather than one tile
   (the same total bytes, still linear in `T`, in one allocation), and raising
   `scan_chunk` no longer buys anything, because it was never a launch-count
   knob after this and the `T * scan_chunk` score term makes a larger tile cost
@@ -50,6 +52,20 @@ affected.
   denominator's rounding changes: it accumulates through the scan's float32
   cross-chunk state and bfloat16 tile matmul instead of a separate float32
   prefix followed by a bfloat16 dot.
+- **Retention phases now have an explicit precision policy.** Static bank
+  weights, dynamic EMA weights and normalized retained mass construct position
+  coordinates, cumulative logs and exponentials in float32 (float64 for a
+  float64 caller), then cast only the finished weights to the stream dtype.
+  BF16 cannot represent every integer above 256, so constructing a 512-wide
+  phase directly in BF16 aliased adjacent positions and changed the intended
+  recurrence. Value and gradient regressions cover both static and dynamic
+  retentions at that width.
+- **The plain cross-tile carry is strictly causal in floating point.** Its
+  exclusive prefix is now a shifted inclusive cumulative sum. The previous
+  `(prefix + current) - current` form was algebraically equivalent but could
+  retain a rounding residue from the current tile, giving earlier outputs a
+  tiny dependence on later inputs. A reduced-precision causality regression
+  now requires exact invariance.
 - Documented that `torch.compile` and `torch.utils.checkpoint` do not compose
   here. Compiling a model whose residual blocks are activation checkpointed
   leaves the elementwise work unfused and measured as a complete no-op; the two
@@ -84,10 +100,11 @@ affected.
   measurements are unaffected: they ran without that package, where `auto`
   resolved to `quad`.
 - Reproducing a published v0.1.0 number bit for bit now requires
-  `backend="quad"` explicitly, or equivalently `scan_chunk >= T`. `chunk`
-  computes tile-local retention exponents, which is a different summation order
-  from the global cumulative sum in `quad`; parity is bounded closeness in
-  reduced precision and exact in float64.
+  `backend="quad"` explicitly. `chunk` computes tile-local retention exponents
+  and constructs every retained phase in at least float32; both differ from the
+  legacy global low-precision cumulative sum in `quad`. Parity is mathematical
+  agreement and float64 exactness, not bitwise identity in reduced precision,
+  even when `scan_chunk >= T`.
 - Replaced the unused private `chunk_size` field with `scan_chunk`, which now
   drives both the tiled scan and the retention-weighted mass.
 - Added `benchmarks/scan_backends.py`, a same-process backend A/B that replays
@@ -112,12 +129,13 @@ affected.
   every temporal mode. Resolution now happens each call; it is pure Python over
   config fields and the input device, so a compiler folds it away. A regression
   test counts traced graphs for the sum, EMA and bank modes and requires one.
-- A second cause remains and is **not** fixed: with an active retention the read
-  closure reads a list of freshly allocated retention tensors as closure state,
-  which TorchDynamo weak-references and invalidates every step. Measured on an
-  H100 in fresh processes, compilation is worth substantially less with a
-  retention active than without one. Fixing it means passing the temporal state
-  as explicit arguments rather than free variables.
+- **Fixed the remaining retained-view recompilation.** Scan-slot deduplication
+  converted each freshly allocated retention tensor's identity into a Python
+  integer; TorchDynamo guarded that changing integer and retraced every forward.
+  It now records the fixed alias pattern through direct object comparisons and
+  precomputes term slots without putting `id(tensor)` into graph data. Sum, EMA
+  and bank each stay in one traced graph, and a fullgraph forward-and-backward
+  regression covers all three.
 - Split the roadmap: [ROADMAP.md](ROADMAP.md) keeps public direction, and the
   measured execution internals moved to an untracked private file.
 - Added a multi-view read capability -- `scan_chunk.linattn_views`,
@@ -125,8 +143,8 @@ affected.
   for every temporal view of a recency bank instead of one per view, and states
   each view as a signed combination of plain scans so a stale view needs no scan
   of its own. `linattn` and `dual_read` are now one-view wrappers over it. The
-  mixer does **not** yet use the grouped form, because handing the engine a
-  container of view objects triggers the recompile fallback noted above.
+  mixer does **not** yet route its temporal branches through the grouped entry
+  point; the capability remains available at the engine level.
 
 ## 0.1.0 - 2026-07-24
 

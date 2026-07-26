@@ -252,10 +252,9 @@ are read, which is the dominant cost of the mixer. `sum` and `ema` are one read
 each. A bank is the sum plus one read per recency branch, so the two-branch
 reference recipe is three reads. `ema` therefore buys forgetting at one read
 where a bank buys a learned mixture of timescales at three; if one timescale is
-enough for the task, `ema` is the cheaper way to get it. `sum` additionally
-compiles more cleanly than either retained mode -- see
-[Compilation](#compilation) -- and is the only mode the optional `fla` backend
-supports.
+enough for the task, `ema` is the cheaper way to get it. All three modes trace
+as one graph under `torch.compile`; the bank still performs more reads. `sum`
+is the only mode the optional `fla` backend supports.
 
 Example two-recency-branch temporal-mode bank:
 
@@ -396,13 +395,12 @@ byte-identical kernel profile -- because the checkpoint boundary keeps the
 elementwise work from fusing. The two decisions are the host's and they only pay
 together; a caller who enables one and not the other should not expect either.
 
-`temporal.mode="sum"` traces to a single graph and compiles cleanly. A mode that
-carries a retention -- `"ema"` and `"bank"` -- currently does not. The read hands
-the engine an accumulator object that owns a freshly allocated decay stream;
-TorchDynamo guards that tensor by identity, the guard is invalidated on every
-step, and the frame eventually falls back. Results stay correct -- only the
-speed-up is lost. This is a limitation of the current implementation rather than
-of the algorithm, and it is independent of the selected backend.
+`temporal.mode="sum"`, `"ema"` and `"bank"` each trace to one graph. Retained
+views rebuild their decay streams on every forward, but scan-slot bookkeeping
+compares their alias relationships directly instead of converting tensor
+identity into guarded Python integers. A fullgraph forward-and-backward
+regression test covers all three modes. Retained modes still perform more work
+than a sum, so one graph does not imply equal wall time.
 
 One consequence worth knowing before benchmarking: a compiled measurement is
 only meaningful with a non-zero blend: at the default zero-initialized
@@ -413,7 +411,12 @@ time no longer depends on `scan_chunk`, because the tiles are not unrolled.
 `quad` is the masked-matmul dual form. It materializes the full `[B, H, T, T]`
 causal score, and a second tensor of that shape when a retention is active. It
 remains the reference implementation and the backend the published v0.1.0
-measurements used; `chunk` with `scan_chunk >= T` reproduces it bit for bit.
+measurements used; select it explicitly for bit-for-bit reproduction. `chunk`
+agrees with the mathematical scan and is exact against the float64 oracle. In
+reduced precision it can round differently even when `scan_chunk >= T`.
+Retained phases are deliberately formed in at least float32 before their
+finished weights are cast, preventing BF16/FP16 position aliasing inside a
+wide tile; legacy `quad` does not provide that precision guarantee.
 
 `cumsum` supports `temporal.mode="sum"` only and validation rejects it with
 `ema` or `bank`: its decayed form divides by a clamped cumulative product and

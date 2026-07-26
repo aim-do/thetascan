@@ -1,6 +1,7 @@
 """Exactness, gradient and footprint coverage for the chunked scan backend."""
 from __future__ import annotations
 
+import math
 import unittest
 from unittest import mock
 
@@ -9,7 +10,7 @@ import torch
 from thetascan import ThetaScan, ThetaScanConfig
 from thetascan._core.ops import scan_chunk, scan_naive, scan_quad
 from thetascan._core.ops.interface import (Accumulator, FadeFast, FadeStale,
-                                           NullAccumulator)
+                                           NullAccumulator, ema_cumsum)
 
 CHUNKS = (1, 3, 8, 64, 128)
 
@@ -136,6 +137,89 @@ class ChunkedScanExactnessTests(unittest.TestCase):
                 tolerance = 1e-5 if dtype is torch.float32 else 5e-2
                 self.assertLess(error / scale, tolerance)
 
+    def test_bfloat16_chunk_512_static_bank_has_no_position_aliases(self) -> None:
+        """A 512-wide bank tile must form its exponents before BF16 rounding."""
+        alpha = 0.9
+        log_alpha = torch.tensor([alpha]).log()
+        tile, _ = scan_chunk._static_weights(
+            log_alpha, 512, torch.bfloat16, torch.device("cpu")
+        )
+        subdiagonal = torch.diagonal(tile[0], offset=-1)
+        expected_weight = torch.exp(log_alpha).to(torch.bfloat16)
+        self.assertTrue(torch.equal(
+            subdiagonal,
+            expected_weight.expand_as(subdiagonal),
+        ))
+
+        # Pin the end-to-end recurrence too: the old BF16-index construction
+        # oscillated by roughly one full unit after position 256.
+        length = 600
+        stream = torch.ones(1, 1, length, 1, dtype=torch.bfloat16)
+        actual = scan_chunk.linattn(
+            stream, stream, stream, chunk=512, log_alpha=log_alpha
+        ).float().flatten()
+        position = torch.arange(1, length + 1, dtype=torch.float64)
+        expected = (
+            (1.0 - alpha ** position) / (1.0 - alpha)
+        ).float()
+        self.assertLess(float((actual - expected).abs().max()), 0.1)
+
+    def test_bfloat16_chunk_512_dynamic_ema_has_no_log_cumsum_aliases(self) -> None:
+        """A per-token EMA must differ phases in FP32, then round its weights."""
+        alpha = 0.982
+        log_alpha = torch.tensor(alpha).log()
+        decay = torch.full(
+            (1, 1, 512, 1), float(log_alpha), dtype=torch.bfloat16
+        )
+        tile, _ = scan_chunk._tile_weights(
+            decay,
+            tiles=1,
+            width=512,
+            heads=1,
+            static=None,
+            dtype=torch.bfloat16,
+        )
+        subdiagonal = torch.diagonal(tile[0, 0, 0], offset=-1)
+        expected_weight = torch.exp(decay.reshape(-1)[0].float()).to(
+            torch.bfloat16
+        )
+        self.assertTrue(torch.equal(
+            subdiagonal,
+            expected_weight.expand_as(subdiagonal),
+        ))
+
+        length = 600
+        stream = torch.ones(1, 1, length, 1, dtype=torch.bfloat16)
+        dynamic = decay[:, :, :1].expand(1, 1, length, 1)
+        actual = scan_chunk.linattn(
+            stream, stream, stream, dynamic, chunk=512
+        ).float().flatten()
+        # The input log-retention is BF16, while its exponent is evaluated in
+        # FP32.  Use that effective alpha rather than exponentiating in BF16 a
+        # second time.
+        rounded_alpha = math.exp(float(decay.reshape(-1)[0]))
+        position = torch.arange(1, length + 1, dtype=torch.float64)
+        expected = (
+            (1.0 - rounded_alpha ** position) / (1.0 - rounded_alpha)
+        ).float()
+        self.assertLess(float((actual - expected).abs().max()), 0.35)
+
+    def test_bfloat16_chunk_512_static_mass_has_no_position_aliases(self) -> None:
+        """The normalized bank denominator must use the numerator's FP32 phases."""
+        alpha = 0.9
+        log_alpha = torch.tensor([alpha]).log()
+        length = 600
+        stream = torch.ones(1, 1, length, 1, dtype=torch.bfloat16)
+        actual = ema_cumsum(
+            stream, log_alpha, chunk=512
+        ).float().flatten()
+        position = torch.arange(1, length + 1, dtype=torch.float64)
+        expected = (
+            (1.0 - alpha ** position) / (1.0 - alpha)
+        ).float()
+        # The old BF16 arange path missed this by >1.0 around position 256.
+        self.assertLess(float((actual - expected).abs().max()), 0.1)
+
     def test_rejects_channel_decay_and_a_degenerate_tile(self) -> None:
         q, k, v, _ = _streams()
         channel = -torch.rand_like(k)
@@ -147,6 +231,41 @@ class ChunkedScanExactnessTests(unittest.TestCase):
             scan_chunk.linattn(
                 q, k, v, chunk=8, log_alpha=torch.zeros(7, dtype=torch.float64)
             )
+
+
+class ChunkedScanCausalityTests(unittest.TestCase):
+    """No output may depend on a later position, not even by rounding.
+
+    The tile axis carries an exclusive scan of per-tile updates. Forming it by
+    subtracting each tile's own term from the inclusive scan is algebraically
+    exact and numerically is not: the state entering a tile then depends on that
+    tile's own tokens at the level of rounding, which makes the scan causal only
+    to within round-off. Nothing else notices -- every oracle comparison has a
+    tolerance far above it -- so it is tested by perturbation.
+    """
+
+    def _leak(self, chunk: int, cut: int, **kwargs) -> float:
+        q, k, v, _ = _streams(T=24, B=1, H=2)
+        base = scan_chunk.linattn(q, k, v, chunk=chunk, **kwargs)
+        for stream in (k, v):
+            stream[:, :, cut:] += 2.0
+        moved = scan_chunk.linattn(q, k, v, chunk=chunk, **kwargs)
+        return float((moved - base)[:, :, :cut].abs().max())
+
+    def test_a_later_key_or_value_never_moves_an_earlier_output(self) -> None:
+        for chunk in (3, 8, 24, 128):
+            for cut in (1, 9, 16):
+                with self.subTest(chunk=chunk, cut=cut):
+                    self.assertEqual(self._leak(chunk, cut), 0.0)
+
+    def test_the_retained_views_are_causal_too(self) -> None:
+        _, _, _, log_alpha = _streams(T=24, B=1, H=2)
+        alpha = log_alpha[:2]
+        for chunk in (3, 8):
+            with self.subTest(chunk=chunk):
+                self.assertEqual(
+                    self._leak(chunk, 9, log_alpha=alpha), 0.0
+                )
 
 
 class ChunkedScanGradientTests(unittest.TestCase):
@@ -180,6 +299,45 @@ class ChunkedScanGradientTests(unittest.TestCase):
         )
         self.assertIsNotNone(grads[-1])
         self.assertTrue((grads[-1].abs() > 0).all())
+
+    def test_bfloat16_chunk_512_retention_gradients_match_closed_form(self) -> None:
+        """FP32 phase construction must preserve static and dynamic gradients."""
+        length = 512
+        stream = torch.ones(1, 1, length, 1, dtype=torch.bfloat16)
+        cases = (("static", 0.9), ("dynamic", 0.982))
+        for mode, alpha in cases:
+            with self.subTest(mode=mode):
+                log_alpha = torch.tensor(
+                    [math.log(alpha)],
+                    dtype=torch.float32,
+                    requires_grad=True,
+                )
+                if mode == "static":
+                    output = scan_chunk.linattn(
+                        stream,
+                        stream,
+                        stream,
+                        chunk=512,
+                        log_alpha=log_alpha,
+                    )
+                else:
+                    decay = log_alpha.to(torch.bfloat16).view(
+                        1, 1, 1, 1
+                    ).expand(1, 1, length, 1)
+                    output = scan_chunk.linattn(
+                        stream, stream, stream, decay, chunk=512
+                    )
+                output[0, 0, -1, 0].float().backward()
+
+                expected = sum(
+                    power * alpha ** power
+                    for power in range(1, length + 1)
+                )
+                self.assertIsNotNone(log_alpha.grad)
+                actual = float(log_alpha.grad)
+                self.assertTrue(torch.isfinite(log_alpha.grad).all())
+                self.assertGreater(actual, 0.0)
+                self.assertLess(abs(actual - expected) / expected, 5e-3)
 
 
 class ChunkedScanFootprintTests(unittest.TestCase):
@@ -393,11 +551,9 @@ class MultiViewScanTests(unittest.TestCase):
 class GroupedReadEquivalenceTests(unittest.TestCase):
     """A grouped multi-view read must equal one read per view.
 
-    The mixer currently issues one read per view: grouping them shares the score
-    tile and is measurably faster in eager mode, but it puts a container of
-    retention tensors across the compiled-graph boundary, which costs far more
-    than the sharing wins.  The capability is exercised here so
-    that it stays correct until that is resolved.
+    Grouping shares the score tile while retaining one independent state per
+    distinct temporal retention.  Its retention-slot bookkeeping is also part
+    of the compiled graph, so these tests pin both the algebra and sharing.
     """
 
     PRESETS = (
@@ -546,3 +702,37 @@ class CompileStabilityTests(unittest.TestCase):
         ):
             with self.subTest(temporal=label):
                 self.assertEqual(self._traces(temporal, blend), 1)
+
+    def test_retained_modes_are_one_full_forward_graph(self) -> None:
+        """EMA/bank may not silently fall through a Dynamo graph break.
+
+        The trace-count test catches recompilation across steps.  ``fullgraph``
+        complements it by making any break inside the first retained forward a
+        hard error; running backward also exercises the differentiable
+        retention path used by training.
+        """
+        import torch._dynamo as dynamo
+
+        for label, temporal, blend in (
+            ("ema", {"mode": "ema"}, 0.0),
+            ("bank", {}, 0.3),
+        ):
+            with self.subTest(temporal=label):
+                config = ThetaScanConfig.from_dict({
+                    "preset": "kernel_expanded_reference_v0_1",
+                    "d_model": 64,
+                    "n_heads": 2,
+                    "temporal": temporal,
+                    "runtime": {"backend": "chunk", "scan_chunk": 16},
+                })
+                torch.manual_seed(11)
+                mixer = ThetaScan(config)
+                with torch.no_grad():
+                    if mixer._core.fade_eta is not None:
+                        mixer._core.fade_eta.fill_(blend)
+                dynamo.reset()
+                compiled = torch.compile(
+                    mixer, backend="eager", dynamic=False, fullgraph=True
+                )
+                x = torch.randn(1, 32, 64)
+                compiled(x).square().mean().backward()

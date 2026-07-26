@@ -63,7 +63,15 @@ def ema_cumsum(x: torch.Tensor, log_alpha: torch.Tensor, chunk: int = 64) -> tor
     CLAMP trick); the carry re-enters each chunk through alpha^(offset).
     Differentiable in log_alpha. x [B,H,T,...]."""
     B, H, T = x.shape[:3]
-    la = log_alpha.to(dtype=x.dtype, device=x.device).view(H)
+    # Positional phases must not be constructed in BF16/FP16.  Beyond index
+    # 256 BF16 cannot represent every integer, so adjacent rows of the
+    # Toeplitz tile alias and a nominally constant alpha recurrence jumps
+    # between alpha**0, alpha**2, ... .  Form the phases in FP32 (FP64 stays
+    # FP64 for the exact oracle), then round the finished weights to the stream
+    # dtype for the matmul.  This is the same contract as scan_chunk's retained
+    # numerator and keeps normalized bank/fade numerator and mass aligned.
+    phase_dtype = torch.float64 if x.dtype == torch.float64 else torch.float32
+    la = log_alpha.to(dtype=phase_dtype, device=x.device).view(H)
     # No indexed writes into a shared output: the carry is a VIEW of the chunk it
     # came from, and any later in-place write into a shared z would version-bump
     # the storage autograd saved for the carry's backward when T spans chunks.
@@ -71,12 +79,14 @@ def ema_cumsum(x: torch.Tensor, log_alpha: torch.Tensor, chunk: int = 64) -> tor
     carry = None
     for t0 in range(0, T, chunk):
         C = min(T, t0 + chunk) - t0
-        i = torch.arange(C, device=x.device, dtype=x.dtype)
+        i = torch.arange(C, device=x.device, dtype=phase_dtype)
         expo = (i.view(C, 1) - i.view(1, C)).clamp(min=0.0)
-        A = torch.exp(la.view(H, 1, 1) * expo).tril()          # [H,C,C]: alpha^(t-i)
+        A = torch.exp(la.view(H, 1, 1) * expo).tril().to(x.dtype)
+        # [H,C,C]: alpha^(t-i)
         zc = torch.einsum("hij,bhj...->bhi...", A, x[:, :, t0:t0 + C])
         if carry is not None:
-            dec = torch.exp(la.view(1, H, 1) * (i + 1.0))      # [1,H,C]
+            dec = torch.exp(la.view(1, H, 1) * (i + 1.0)).to(x.dtype)
+            # [1,H,C]
             zc = zc + carry.unsqueeze(2) * dec.view(1, H, C, *([1] * (x.dim() - 3)))
         chunks.append(zc)
         carry = zc[:, :, -1]
@@ -122,14 +132,32 @@ def scan_views(views, q, k, v, key_kind: str) -> tuple[torch.Tensor, ...]:
     unchanged rather than routed through a second implementation.
     """
     terms = [view.scan_terms(key_kind) for view in views]
-    slots: dict[object, int] = {}
     retentions: list[object] = []
+    term_slots: list[tuple[int, ...]] = []
     for view_terms in terms:
+        view_slots = []
         for _, retention in view_terms:
-            slot = None if retention is None else id(retention)
-            if slot not in slots:
-                slots[slot] = len(retentions)
+            # Do not turn a tensor's Python identity into graph data.  ``id``
+            # changes on every forward because temporal streams are rebuilt on
+            # every forward, so Dynamo guards that integer and recompiles the
+            # graph on the next step.  Direct alias comparison expresses the
+            # relationship we actually care about: two terms share a scan only
+            # when they reference the same retention tensor.  Dynamo can trace
+            # this fixed alias pattern without a value guard, and the small
+            # view tuple makes the linear lookup negligible.
+            slot = next(
+                (
+                    index
+                    for index, existing in enumerate(retentions)
+                    if retention is existing
+                ),
+                None,
+            )
+            if slot is None:
+                slot = len(retentions)
                 retentions.append(retention)
+            view_slots.append(slot)
+        term_slots.append(tuple(view_slots))
 
     def zeros() -> torch.Tensor:
         return v.new_zeros(*q.shape[:3], v.shape[-1])
@@ -154,13 +182,13 @@ def scan_views(views, q, k, v, key_kind: str) -> tuple[torch.Tensor, ...]:
         )
 
     outputs = []
-    for view_terms in terms:
+    for view_terms, view_slots in zip(terms, term_slots):
         if not view_terms:
             outputs.append(zeros())
             continue
         total = None
-        for coefficient, retention in view_terms:
-            piece = scanned[slots[None if retention is None else id(retention)]]
+        for (coefficient, _), slot in zip(view_terms, view_slots):
+            piece = scanned[slot]
             scaled = piece if coefficient == 1.0 else coefficient * piece
             total = scaled if total is None else total + scaled
         outputs.append(total)
@@ -297,4 +325,3 @@ class NullAccumulator:
 
     def mass_cum(self, keys: torch.Tensor) -> torch.Tensor:
         return torch.zeros_like(keys)
-

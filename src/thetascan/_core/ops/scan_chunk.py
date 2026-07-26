@@ -48,22 +48,23 @@ cross term stays batched.  Stepping it keeps the guarantee that no ``1/alpha^i``
 factor is ever materialized, which is what a log-space parallel form would give
 up.
 
-A single tile is not a wasted case.  At ``chunk >= T`` this backend still beats
-``quad`` on the retained views, because a static retention builds one
+A single tile is not a wasted case.  At ``chunk >= T`` this backend still avoids
+some retained-view overhead, because a static retention builds one
 ``[1, H, T, T]`` weight shared across the batch where ``quad`` builds
 ``[B, H, T, T]`` from a per-token cumulative sum, and because a triangular
 select replaces an explicit boolean mask tensor.  That case also needs no tile
-axis at all, so it is evaluated directly and stays bit-for-bit identical to
-``quad``.
+axis and is evaluated directly.  The plain sum retains the same arithmetic as
+``quad``; a retained reduced-precision scan can differ because this backend
+forms its phases in at least float32 before casting the finished weights.
 
 Retention handling matches :mod:`scan_quad` structurally: a weight is always the
 DIFFERENCE of cumulative logs clamped at zero before ``exp``, so no ``1/alpha^i``
 factor is ever materialized and small retentions cannot overflow.  Because the
 cumulative log is local to a tile, the exponents stay small; that is a different
 rounding order from the global cumulative sum in :mod:`scan_quad`, so parity
-with the legacy backend is bounded closeness, not bitwise identity -- except at
-``chunk >= T``, where the two constructions coincide and the backends agree bit
-for bit.
+with the legacy backend is bounded closeness, not bitwise identity.  Even in one
+tile, the retained path intentionally avoids the low-precision cumulative-log
+aliasing that remains in the legacy backend.
 
 For a static per-head retention the intra-tile weight is a Toeplitz matrix that
 depends on neither the batch nor the tile index, so it is built once per call as
@@ -71,15 +72,31 @@ depends on neither the batch nor the tile index, so it is built once per call as
 
 Precision policy: every matmul runs in the stream dtype, exactly as the
 quadratic backend does, so autocast behaviour is unchanged and a float64 oracle
-stays exact.  Only the running state -- the one value that accumulates across
-the whole sequence, and the one place a chunked scan could lose accuracy that a
-single-matmul form keeps -- is promoted to at least float32.
+stays exact.  Retention coordinates, cumulative logs and exponentials are
+formed in at least float32 before the finished weights are cast to the stream
+dtype; otherwise BF16 aliases positions above 256 inside a 512-wide tile.  The
+running state -- the one value that accumulates across the whole sequence, and
+the one place a chunked scan could lose accuracy that a single-matmul form
+keeps -- is also promoted to at least float32.
 """
 from __future__ import annotations
 
 import torch
 
 DEFAULT_CHUNK = 512
+
+
+def _retention_compute_dtype(dtype: torch.dtype) -> torch.dtype:
+    """Use exact-enough coordinates for retention phases.
+
+    BF16 cannot represent every integer above 256.  Forming a 512-wide
+    Toeplitz tile directly in the stream dtype therefore aliases adjacent
+    positions before ``exp`` (the same failure mode as low-precision RoPE
+    positions).  Retention phases are cheap relative to the score tile, so
+    evaluate them in FP32 and round only the finished weights to the stream
+    dtype.  Float64 remains the exact oracle path.
+    """
+    return torch.float64 if dtype == torch.float64 else torch.float32
 
 
 def _static_weights(
@@ -93,11 +110,12 @@ def _static_weights(
     before ``exp``, which is what stops a small ``alpha`` from producing an
     infinite weight.
     """
-    index = torch.arange(chunk, device=device, dtype=dtype)
+    phase_dtype = _retention_compute_dtype(dtype)
+    index = torch.arange(chunk, device=device, dtype=phase_dtype)
     exponent = (index.view(chunk, 1) - index.view(1, chunk)).clamp(min=0.0)
-    la = log_alpha.to(device=device, dtype=dtype).reshape(-1, 1, 1)
-    tile = torch.exp(la * exponent).tril()
-    carry = torch.exp(la.view(-1, 1) * (index + 1.0))
+    la = log_alpha.to(device=device, dtype=phase_dtype).reshape(-1, 1, 1)
+    tile = torch.exp(la * exponent).tril().to(dtype=dtype)
+    carry = torch.exp(la.view(-1, 1) * (index + 1.0)).to(dtype=dtype)
     return tile, carry
 
 
@@ -108,6 +126,7 @@ def _tile_weights(
     width: int,
     heads: int,
     static: tuple[torch.Tensor, torch.Tensor] | None,
+    dtype: torch.dtype,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     """Return this view's intra-tile weight and incoming-state carry.
 
@@ -126,11 +145,14 @@ def _tile_weights(
             tile.view(1, heads, 1, width, width),
             carry.view(1, heads, 1, width, 1),
         )
-    local = retention.view(-1, heads, tiles, width).cumsum(-1)      # [B,H,NT,C]
+    phase_dtype = _retention_compute_dtype(dtype)
+    local = retention.view(-1, heads, tiles, width).to(
+        dtype=phase_dtype
+    ).cumsum(-1)                                                    # [B,H,NT,C]
     tile = (
         local.unsqueeze(-1) - local.unsqueeze(-2)
-    ).clamp(max=0.0).exp()                                          # [B,H,NT,C,C]
-    return tile, local.exp().unsqueeze(-1)
+    ).clamp(max=0.0).exp().to(dtype=dtype)                          # [B,H,NT,C,C]
+    return tile, local.exp().to(dtype=dtype).unsqueeze(-1)
 
 
 def _pad_tiles(x: torch.Tensor, pad: int) -> torch.Tensor:
@@ -163,9 +185,17 @@ def _tile_states(
     """
     tiles = update.shape[2]
     if retention is None:
-        # Exclusive prefix sum: subtracting the inclusive scan's own term is one
-        # kernel and avoids a shifted copy.
-        return update.cumsum(2) - update
+        # Exclusive prefix sum, by shifting the inclusive one rather than
+        # subtracting each tile's own term from it.  Subtracting is algebraically
+        # identical and one kernel cheaper, but not identical in floating point:
+        # ``(U0 + U1) - U1`` is ``U0`` only up to rounding, which makes the state
+        # entering a tile depend faintly on that tile's own tokens -- a causal
+        # scan that is causal only to within round-off.  The shift has no such
+        # term, so a position's output depends on no later position at all.
+        inclusive = update.cumsum(2)
+        return torch.cat(
+            [torch.zeros_like(update[:, :, :1]), inclusive[:, :, :-1]], dim=2
+        )
     if static_log_alpha is not None:
         # One [H,NT,NT] geometric weight over the tile axis.  Exponents are
         # clamped before exp, so a small alpha cannot overflow, and the strictly
@@ -191,8 +221,9 @@ def _single_tile(
 ) -> tuple[torch.Tensor, ...]:
     """The ``chunk >= T`` case, evaluated without a tile axis.
 
-    Keeping this path in the untiled shape is what makes the single-tile result
-    bit-for-bit identical to :mod:`scan_quad`, which is the documented contract.
+    This keeps the plain-sum arithmetic aligned with :mod:`scan_quad`. Retained
+    phases still use this backend's at-least-FP32 precision policy, so a
+    reduced-precision result may intentionally differ from the legacy backend.
     """
     scores = q @ k.transpose(-1, -2)
     outputs = []
@@ -202,8 +233,11 @@ def _single_tile(
         elif static is not None:
             tile = static[0].unsqueeze(0)
         else:
-            local = retention[..., 0].cumsum(-1)
-            tile = (local.unsqueeze(-1) - local.unsqueeze(-2)).clamp(max=0.0).exp()
+            phase_dtype = _retention_compute_dtype(q.dtype)
+            local = retention[..., 0].to(dtype=phase_dtype).cumsum(-1)
+            tile = (
+                local.unsqueeze(-1) - local.unsqueeze(-2)
+            ).clamp(max=0.0).exp().to(dtype=q.dtype)
         weighted = scores if tile is None else scores * tile
         outputs.append(weighted.tril() @ v)
     return tuple(outputs)
@@ -275,6 +309,7 @@ def linattn_views(
         tile, carry = _tile_weights(
             stream if stream is not None else retention,
             tiles=tiles, width=width, heads=heads, static=statics[index],
+            dtype=q.dtype,
         )
         weighted = scores if tile is None else scores * tile
         out = weighted.tril() @ vt

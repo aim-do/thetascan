@@ -424,9 +424,12 @@ class RuntimeConfig:
     debugging, profiling and parity: ``naive`` is the sequential reference loop;
     ``quad`` is the masked-matmul dual form, which materializes the full
     causal score matrix (O(T^2) memory) and trades that for one large matmul --
-    it is the reference the published v0.1.0 measurements used, and ``chunk``
-    with ``scan_chunk >= T`` reproduces it bit for bit; ``cumsum`` is the
-    prefix-scan form.
+    it is the reference the published v0.1.0 measurements used, so select it
+    explicitly for bit-for-bit reproduction.  ``chunk`` agrees with the
+    mathematical scan and the float64 oracle, but reduced-precision rounding
+    can differ even when ``scan_chunk >= T``; retained phases are formed in at
+    least float32 to prevent position aliasing.  ``cumsum`` is the prefix-scan
+    form.
     ``cumsum`` supports ``temporal.mode='sum'`` only: its decay handling
     divides by a clamped cumulative product, which silently loses precision
     once the accumulated decay of a long sequence exceeds the guard range.
